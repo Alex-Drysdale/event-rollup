@@ -582,7 +582,8 @@ fn parse_clicks(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
 struct A2 {
     ev: Vec<Vec<PRec>>,
     ck: Vec<Vec<CRec>>,
-    table: Vec<(u64, usize)>,
+    table: Vec<u32>,
+    lost: Vec<u64>,
 }
 
 #[inline(never)]
@@ -591,30 +592,58 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
     if n == 0 {
         return;
     }
+    // Keep, per event_id, the copy with the smallest ingest_ts. A slot holds a
+    // tag (hash bits) and the number of a record, counted from 1 across the
+    // workers' lists, in 32 bits, so the table stays in L2; records are only
+    // read when the tags match. A copy that loses is marked in `lost`.
+    assert!(n < (1 << 31), "partition too large");
     let cap = (n * 2).next_power_of_two();
     let mask = cap - 1;
+    let ib = usize::BITS - n.leading_zeros();
+    let imask = (1u32 << ib) - 1;
     let table = &mut out.table;
     table.clear();
-    table.resize(cap, (0, 0));
-    // Keep, per event_id, the copy with the smallest ingest_ts. Slots hold
-    // (hash, record address); records are only read when the hashes match.
+    table.resize(cap, 0);
+    let lost = &mut out.lost;
+    lost.clear();
+    lost.resize(n.div_ceil(64), 0);
+    let rec_at = |mut i: usize| -> &ERec {
+        for a in a1s {
+            let v = &a.ev.outs[p];
+            if i < v.len() {
+                return &v[i];
+            }
+            i -= v.len();
+        }
+        unreachable!()
+    };
+    let mut idx = 0u32;
     for a in a1s {
         for r in &a.ev.outs[p] {
+            idx += 1;
             let k = r.eid();
             let hk = keys::hash(k);
+            // The partition is the top bits of the hash and the slot the low
+            // ones: take the tag from the middle.
+            let tag = ((hk >> 20) as u32) & !imask;
             let mut h = hk as usize & mask;
             loop {
-                let (th, t) = table[h];
+                let t = table[h];
                 if t == 0 {
-                    table[h] = (hk, r as *const ERec as usize);
+                    table[h] = tag | idx;
                     break;
                 }
-                if th == hk {
-                    let tr = unsafe { &*(t as *const ERec) };
+                if t & !imask == tag {
+                    let j = (t & imask) as usize - 1;
+                    let tr = rec_at(j);
                     if tr.eid() == k {
-                        if r.ingest_code() < tr.ingest_code() {
-                            table[h].1 = r as *const ERec as usize;
-                        }
+                        let loser = if r.ingest_code() < tr.ingest_code() {
+                            table[h] = tag | idx;
+                            j
+                        } else {
+                            idx as usize - 1
+                        };
+                        lost[loser / 64] |= 1 << (loser % 64);
                         break;
                     }
                 }
@@ -636,34 +665,19 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
             out.ev[q].push(PRec { key, p_lo, p_hi, price, cat });
         }
     };
+    let mut i = 0usize;
     for a in a1s {
         for r in &a.ev.outs[p] {
-            if !r.ok() {
+            let lost = out.lost[i / 64] >> (i % 64) & 1 != 0;
+            i += 1;
+            if !r.ok() || lost {
                 continue;
             }
-            let k = r.eid();
-            let hk = keys::hash(k);
-            let mut h = hk as usize & mask;
-            let me = r as *const ERec as usize;
-            let winner = loop {
-                let (th, t) = out.table[h];
-                if th == hk {
-                    if t == me {
-                        break true;
-                    }
-                    if unsafe { &*(t as *const ERec) }.eid() == k {
-                        break false;
-                    }
-                }
-                h = (h + 1) & mask;
-            };
-            if winner {
-                batch[nb] = (join_key(r.user_lo, r.user_hi), r.ts, r.price, r.cat());
-                nb += 1;
-                if nb == BATCH {
-                    flush(&batch, out);
-                    nb = 0;
-                }
+            batch[nb] = (join_key(r.user_lo, r.user_hi), r.ts, r.price, r.cat());
+            nb += 1;
+            if nb == BATCH {
+                flush(&batch, out);
+                nb = 0;
             }
         }
     }
@@ -1112,6 +1126,7 @@ fn main() {
             ev: (0..nq).map(|_| Vec::with_capacity(ev_reserve2)).collect(),
             ck: (0..nq).map(|_| Vec::with_capacity(ck_reserve2)).collect(),
             table: Vec::new(),
+            lost: Vec::new(),
         },
         |acc, j| {
             if j < np {
