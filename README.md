@@ -33,7 +33,11 @@ binary reads the CSV inputs in `/data`, applies `rules.md`, and writes
    (hash tag + record number) finds the copies of each event_id; the copy with
    the smallest ingest_ts is kept and the others are marked in a bitmap. The
    kept copy survives only if its flag is set. Survivors and clicks are mapped
-   to their person and scattered by person.
+   to their person and scattered by person. Partition buffers are lists of
+   16 KB chunks from large anonymous mappings (huge pages advised), so nothing
+   is over-reserved; the chunks of an event partition are reused for the
+   person partitions as soon as it is deduplicated, so little fresh memory is
+   faulted in after the parse.
 5. **Sessions and attribution.** Per person partition, events are sorted by
    (person, ts) and clicks by (person, ts, click_id descending). One pass per
    person splits sessions on gaps over 30 minutes and slides a 7-day click

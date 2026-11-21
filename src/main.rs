@@ -17,6 +17,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use keys::{Id, Key, KeyMap};
+use scatter::{Chunks, Pool};
 use table::ShardedMap;
 use ts::DAY_MS;
 
@@ -585,11 +586,18 @@ fn parse_clicks(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
 // Dedup pass
 
 struct A2 {
-    ev: Vec<Vec<PRec>>,
-    ck: Vec<Vec<CRec>>,
+    ev: Vec<Chunks<PRec>>,
+    ck: Vec<Chunks<CRec>>,
+    /// Where the chunks of `ev` and `ck` come from: mostly the chunks of the
+    /// event partitions this worker has already deduplicated.
+    pool: Pool,
     table: Vec<u32>,
     lost: Vec<u64>,
 }
+
+/// log2 of the event records in a chunk.
+const ECHUNK_SHIFT: u32 = Chunks::<ERec>::CAP.trailing_zeros();
+const _: () = assert!(Chunks::<ERec>::CAP.is_power_of_two() && std::mem::size_of::<ERec>() == 32);
 
 #[inline(never)]
 fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mut A2) {
@@ -598,34 +606,28 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
         return;
     }
     // Keep, per event_id, the copy with the smallest ingest_ts. A slot holds a
-    // tag (hash bits) and the number of a record, counted from 1 across the
-    // workers' lists, in 32 bits, so the table stays in L2; records are only
-    // read when the tags match. A copy that loses is marked in `lost`.
-    assert!(n < (1 << 31), "partition too large");
+    // tag (hash bits) and the number of a record plus 1, in 32 bits, so the
+    // table stays in L2; records are only read when the tags match. A record's
+    // number is its chunk's place among the partition's chunks (all workers'
+    // lists, in order) times the chunk capacity, plus its place in the chunk.
+    // A copy that loses is marked in `lost`.
+    let chunks: Vec<&[ERec]> = a1s.iter().flat_map(|a| a.ev.outs[p].slices()).collect();
+    let numbers = chunks.len() << ECHUNK_SHIFT;
+    assert!(numbers < (1 << 31), "partition too large");
     let cap = (n * 2).next_power_of_two();
     let mask = cap - 1;
-    let ib = usize::BITS - n.leading_zeros();
+    let ib = usize::BITS - numbers.leading_zeros();
     let imask = (1u32 << ib) - 1;
     let table = &mut out.table;
     table.clear();
     table.resize(cap, 0);
     let lost = &mut out.lost;
     lost.clear();
-    lost.resize(n.div_ceil(64), 0);
-    let rec_at = |mut i: usize| -> &ERec {
-        for a in a1s {
-            let v = &a.ev.outs[p];
-            if i < v.len() {
-                return &v[i];
-            }
-            i -= v.len();
-        }
-        unreachable!()
-    };
-    let mut idx = 0u32;
-    for a in a1s {
-        for r in &a.ev.outs[p] {
-            idx += 1;
+    lost.resize(numbers.div_ceil(64), 0);
+    let rec_at = |i: usize| -> &ERec { &chunks[i >> ECHUNK_SHIFT][i & ((1 << ECHUNK_SHIFT) - 1)] };
+    for (c, chunk) in chunks.iter().enumerate() {
+        for (o, r) in chunk.iter().enumerate() {
+            let idx = ((c << ECHUNK_SHIFT) + o + 1) as u32;
             let k = r.eid;
             let hk = keys::id_hash(k);
             // The partition is the top bits of the hash and the slot the low
@@ -666,14 +668,13 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
         for &(user, ts, price, cat) in batch {
             let person = links.get_or_self(user);
             let (q, key) = ctx.qpart_key(person, ts);
-            out.ev[q].push(PRec { key, person, price, cat });
+            out.ev[q].push(&mut out.pool, PRec { key, person, price, cat });
         }
     };
-    let mut i = 0usize;
-    for a in a1s {
-        for r in &a.ev.outs[p] {
+    for (c, chunk) in chunks.iter().enumerate() {
+        for (o, r) in chunk.iter().enumerate() {
+            let i = (c << ECHUNK_SHIFT) + o;
             let lost = out.lost[i / 64] >> (i % 64) & 1 != 0;
-            i += 1;
             if !r.ok() || lost {
                 continue;
             }
@@ -686,6 +687,14 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
         }
     }
     flush(&batch[..nb], out);
+    // Each partition is read by exactly one job, and this one has finished
+    // with it: its chunks are free to hold this worker's output from now on.
+    drop(chunks);
+    for a in a1s {
+        for c in a.ev.outs[p].raw() {
+            out.pool.give(c);
+        }
+    }
 }
 
 #[inline(never)]
@@ -697,7 +706,7 @@ fn map_clicks(recs: &[CRaw], ctx: &Ctx, links: &ShardedMap, out: &mut A2) {
         for r in chunk {
             let person = links.get_or_self(r.user);
             let (q, key) = ctx.qpart_key(person, r.ts);
-            out.ck[q].push(CRec { key, person, cid: r.cid, camp: r.camp });
+            out.ck[q].push(&mut out.pool, CRec { key, person, cid: r.cid, camp: r.camp });
         }
     }
 }
@@ -919,10 +928,10 @@ fn process_partition(q: usize, a2s: &[A2], ctx: &Ctx, acc: &mut A3) {
     let mut ck = std::mem::take(&mut acc.ck);
     // Gather and sort in one go: by key (person hash, then ts), clicks then by
     // click_id descending.
-    bucket_sort(a2s.iter().map(|a| &a.ev[q][..]), &mut ev, &mut acc.counts_sort, |r| r.key, |a, b| {
+    bucket_sort(a2s.iter().flat_map(|a| a.ev[q].slices()), &mut ev, &mut acc.counts_sort, |r| r.key, |a, b| {
         a.key.cmp(&b.key)
     });
-    bucket_sort(a2s.iter().map(|a| &a.ck[q][..]), &mut ck, &mut acc.counts_sort, |r| r.key, |a, b| {
+    bucket_sort(a2s.iter().flat_map(|a| a.ck[q].slices()), &mut ck, &mut acc.counts_sort, |r| r.key, |a, b| {
         a.key.cmp(&b.key).then_with(|| keys::id_cmp(b.cid, a.cid))
     });
     if !ev.is_empty() {
@@ -1088,16 +1097,14 @@ fn main() {
         jobs.extend(csv::chunks(m, cfg.chunk).into_iter().map(|(s, e)| (Kind::Clicks, fi, s, e)));
     }
     jobs.sort_by_key(|j| std::cmp::Reverse(j.3 - j.2));
-    let ev_bytes: usize = ev_files.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_files.iter().map(|m| m.len()).sum();
-    let ev_reserve = ev_bytes / 64 / nw / np * 5 / 4 + 16;
     let ck_reserve = ck_bytes / 40 / nw * 5 / 4 + 16;
     let release = std::env::var_os("SS_KEEP").is_none();
     let (links, a1s) = {
         let a1s = workers_then(
             env_usize("SS_PARSE_THREADS").unwrap_or(nw),
             jobs.len(),
-            || A1 { ev: scatter::Scatter::new(np, ev_reserve), ck: Vec::with_capacity(ck_reserve) },
+            || A1 { ev: scatter::Scatter::new(np), ck: Vec::with_capacity(ck_reserve) },
             |acc, j| {
                 let (kind, fi, s, e) = jobs[j];
                 let file = match kind {
@@ -1122,10 +1129,6 @@ fn main() {
         log!(t0, "parsed");
         (link_handle.join().unwrap(), a1s)
     };
-    if std::env::var_os("SS_DEBUG").is_some() {
-        let aligned = a1s.iter().flat_map(|a| a.ev.outs.iter()).filter(|v| v.as_ptr() as usize % 64 == 0).count();
-        log!(t0, "scatter buffers 64-byte aligned: {aligned} of {}", a1s.len() * np);
-    }
     let n_ev: usize = a1s.iter().map(|a| a.ev.outs.iter().map(|v| v.len()).sum::<usize>()).sum();
     let n_ck: usize = a1s.iter().map(|a| a.ck.len()).sum();
     log!(t0, "phase 1: {} event lines, {} valid clicks", n_ev, n_ck);
@@ -1136,14 +1139,13 @@ fn main() {
         .enumerate()
         .flat_map(|(w, a)| (0..a.ck.len()).step_by(1 << 16).map(move |s| (w, s, (s + (1 << 16)).min(a.ck.len()))))
         .collect();
-    let ev_reserve2 = n_ev / nw / nq * 5 / 4 + 16;
-    let ck_reserve2 = n_ck / nw / nq * 5 / 4 + 16;
     let a2s = workers_then(
         nw,
         np + ck_jobs.len(),
         || A2 {
-            ev: (0..nq).map(|_| Vec::with_capacity(ev_reserve2)).collect(),
-            ck: (0..nq).map(|_| Vec::with_capacity(ck_reserve2)).collect(),
+            ev: (0..nq).map(|_| Chunks::new()).collect(),
+            ck: (0..nq).map(|_| Chunks::new()).collect(),
+            pool: Pool::new(),
             table: Vec::new(),
             lost: Vec::new(),
         },
