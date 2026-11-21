@@ -264,7 +264,12 @@ fn map_file(path: &Path) -> Option<Mmap> {
     if len == 0 {
         return None;
     }
-    unsafe { Mmap::map(&f).ok() }
+    let m = unsafe { Mmap::map(&f).ok()? };
+    // Ask the kernel to read the whole file ahead now, in case it is not cached.
+    if std::env::var_os("SS_NOWILLNEED").is_none() {
+        let _ = m.advise(memmap2::Advice::WillNeed);
+    }
+    Some(m)
 }
 
 /// Every `*.csv` in a folder, mapped (empty files skipped).
@@ -658,6 +663,7 @@ struct A3 {
     cats: Vec<(u16, u64)>,
     ev: Vec<PRec>,
     ck: Vec<CRec>,
+    counts_sort: Vec<u32>,
 }
 
 impl A3 {
@@ -671,6 +677,7 @@ impl A3 {
             cats: Vec::new(),
             ev: Vec::new(),
             ck: Vec::new(),
+            counts_sort: Vec::new(),
         }
     }
 
@@ -793,19 +800,80 @@ fn process_person(person: Key, evs: &[PRec], clicks: &[CRec], ctx: &Ctx, acc: &m
 }
 
 #[inline(never)]
+/// Concatenates `parts` into `out`, sorted by `cmp`, which must order by
+/// `key` first. A counting sort on the key's top bits leaves small buckets
+/// (usually one person each) that are finished by insertion sort.
+fn bucket_sort<'a, T: Copy + 'a>(
+    parts: impl Iterator<Item = &'a [T]> + Clone,
+    out: &mut Vec<T>,
+    counts: &mut Vec<u32>,
+    key: impl Fn(&T) -> u64,
+    cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    let n: usize = parts.clone().map(|p| p.len()).sum();
+    out.clear();
+    if n == 0 {
+        return;
+    }
+    let bits = (usize::BITS - (n / 4).max(2).leading_zeros()).clamp(1, 16);
+    let shift = 64 - bits;
+    let nb = 1usize << bits;
+    counts.clear();
+    counts.resize(nb + 1, 0);
+    for p in parts.clone() {
+        for r in p {
+            counts[(key(r) >> shift) as usize + 1] += 1;
+        }
+    }
+    for i in 0..nb {
+        counts[i + 1] += counts[i];
+    }
+    out.reserve(n);
+    let dst = out.as_mut_ptr();
+    {
+        let mut pos: Vec<u32> = counts[..nb].to_vec();
+        for p in parts {
+            for r in p {
+                let b = (key(r) >> shift) as usize;
+                unsafe { dst.add(pos[b] as usize).write(*r) };
+                pos[b] += 1;
+            }
+        }
+    }
+    unsafe { out.set_len(n) };
+    for b in 0..nb {
+        let (s, e) = (counts[b] as usize, counts[b + 1] as usize);
+        let bucket = &mut out[s..e];
+        if bucket.len() <= 24 {
+            for i in 1..bucket.len() {
+                let x = bucket[i];
+                let mut j = i;
+                while j > 0 && cmp(&bucket[j - 1], &x) == std::cmp::Ordering::Greater {
+                    bucket[j] = bucket[j - 1];
+                    j -= 1;
+                }
+                bucket[j] = x;
+            }
+        } else {
+            bucket.sort_unstable_by(&cmp);
+        }
+    }
+}
+
+#[inline(never)]
 fn process_partition(q: usize, a2s: &[A2], ctx: &Ctx, acc: &mut A3) {
     let mut ev = std::mem::take(&mut acc.ev);
     let mut ck = std::mem::take(&mut acc.ck);
-    ev.clear();
-    ck.clear();
-    for a in a2s {
-        ev.extend_from_slice(&a.ev[q]);
-        ck.extend_from_slice(&a.ck[q]);
-    }
+    // Gather and sort in one go: by key (person hash, then ts), clicks then by
+    // click_id descending.
+    bucket_sort(a2s.iter().map(|a| &a.ev[q][..]), &mut ev, &mut acc.counts_sort, |r| r.key, |a, b| {
+        a.key.cmp(&b.key)
+    });
+    bucket_sort(a2s.iter().map(|a| &a.ck[q][..]), &mut ck, &mut acc.counts_sort, |r| r.key, |a, b| {
+        a.key.cmp(&b.key).then_with(|| keys::cmp(b.cid(), a.cid()))
+    });
     if !ev.is_empty() {
         let tb = ctx.ts_bits;
-        ev.sort_unstable_by_key(|r| r.key);
-        ck.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| keys::cmp(b.cid(), a.cid())));
         // Two people whose hashes agree in the key bits would interleave: detect
         // that and fall back to sorting by the full person ID.
         let collide_ev = ev.windows(2).any(|w| (w[0].key ^ w[1].key) >> tb == 0 && w[0].person() != w[1].person());
@@ -987,7 +1055,7 @@ fn main() {
             l
         });
         let a1s = workers(
-            nw,
+            env_usize("SS_PARSE_THREADS").unwrap_or(nw),
             jobs.len(),
             || A1 {
                 ev: (0..np).map(|_| Vec::with_capacity(ev_reserve)).collect(),
