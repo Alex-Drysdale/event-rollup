@@ -122,66 +122,72 @@ impl ShardedMap {
     }
 }
 
-/// Dense ids for distinct keys: shard `s` owns ids `offsets[s]..offsets[s+1]`.
-pub struct Interner {
-    pub map: ShardedMap,
-    /// The key of each id.
-    pub keys: Vec<Key>,
-    /// Shard `s` owns ids `offsets[s]..offsets[s + 1]`.
-    pub offsets: Vec<usize>,
+/// A key and where its id is to be written.
+#[derive(Clone, Copy)]
+pub struct KeyRef {
+    pub lo: u64,
+    pub hi: u64,
+    pub at: u32,
 }
 
-impl Interner {
-    /// `lists[s]`: keys (repeats allowed) whose hash is in shard `s`.
-    pub fn build(lists: &[Vec<Key>]) -> Interner {
-        assert_eq!(lists.len(), SHARDS);
-        let built: Vec<(Shard, Vec<Key>)> = lists
-            .par_iter()
-            .map(|list| {
-                let mut sh = Shard::new(list.len());
-                let mut uniq = Vec::new();
-                for &k in list {
-                    let next = uniq.len() as u128;
-                    if sh.insert(keys::hash(k), k, next) == next {
-                        uniq.push(k);
-                    }
-                }
-                (sh, uniq)
-            })
-            .collect();
-        let mut offsets = Vec::with_capacity(SHARDS);
-        let mut offset = 0u128;
-        let mut keys_all = Vec::new();
-        for (_, uniq) in &built {
-            offsets.push(offset);
-            offset += uniq.len() as u128;
-            keys_all.extend_from_slice(uniq);
-        }
-        let offsets_usize: Vec<usize> = offsets.iter().map(|&o| o as usize).collect();
-        // Turn shard-local ids into global ones.
-        let shards = built
-            .into_par_iter()
-            .zip(offsets)
-            .map(|((mut sh, _), off)| {
-                if off != 0 {
-                    for s in sh.slots.iter_mut() {
-                        if join(s.k) != 0 {
-                            s.v = split(join(s.v) + off);
-                        }
-                    }
-                }
-                sh
-            })
-            .collect();
-        let mut bounds: Vec<usize> = offsets_usize;
-        bounds.push(keys_all.len());
-        Interner { map: ShardedMap { shards }, keys: keys_all, offsets: bounds }
-    }
+/// Bits of an interned id that hold the index within its shard; the shard is above them.
+pub const LOCAL_BITS: u32 = 32 - SHARD_BITS;
 
-    #[inline(always)]
-    pub fn id(&self, k: Key) -> u32 {
-        self.map.get(k).expect("interned key") as u32
-    }
+struct SyncPtr(*mut u32);
+unsafe impl Sync for SyncPtr {}
+
+/// Gives the distinct keys of each shard dense indices in order of first
+/// appearance. `jobs[j][s]` holds the keys of job `j` whose hash is in shard
+/// `s` (repeats allowed); the id of each, `s << LOCAL_BITS | index`, is
+/// written to `out[base[j] + at]`, and every such place must be distinct.
+/// Returns the distinct keys per shard. Each shard is interned by one thread
+/// with a table of 32-bit slots (tag + index) that stays in cache.
+pub fn intern(jobs: &[Vec<Vec<KeyRef>>], base: &[usize], out: &mut [u32]) -> Vec<Vec<Key>> {
+    let len = out.len();
+    let out = SyncPtr(out.as_mut_ptr());
+    (0..SHARDS)
+        .into_par_iter()
+        .map(|s| {
+            let out = &out;
+            let total: usize = jobs.iter().map(|j| j[s].len()).sum();
+            assert!(total < (1 << LOCAL_BITS), "too many link IDs");
+            let cap = (total * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let ib = usize::BITS - total.leading_zeros();
+            let imask = (1u32 << ib) - 1;
+            let mut table = vec![0u32; cap];
+            let mut uniq: Vec<Key> = Vec::with_capacity(total / 2 + 16);
+            for (j, job) in jobs.iter().enumerate() {
+                for r in &job[s] {
+                    let k = join([r.lo, r.hi]);
+                    let h = keys::hash(k);
+                    // The shard is the top bits of the hash and the slot the
+                    // low ones: take the tag from the middle.
+                    let tag = ((h >> 20) as u32) & !imask;
+                    let mut i = h as usize & mask;
+                    let id = loop {
+                        let t = table[i];
+                        if t == 0 {
+                            uniq.push(k);
+                            table[i] = tag | uniq.len() as u32;
+                            break uniq.len() - 1;
+                        }
+                        if t & !imask == tag {
+                            let l = (t & imask) as usize - 1;
+                            if uniq[l] == k {
+                                break l;
+                            }
+                        }
+                        i = (i + 1) & mask;
+                    };
+                    let at = base[j] + r.at as usize;
+                    assert!(at < len);
+                    unsafe { out.0.add(at).write(((s as u32) << LOCAL_BITS) | id as u32) };
+                }
+            }
+            uniq
+        })
+        .collect()
 }
 
 #[inline(always)]

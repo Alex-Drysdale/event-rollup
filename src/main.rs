@@ -17,7 +17,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use keys::{Key, KeyMap};
-use table::{Interner, ShardedMap};
+use table::ShardedMap;
 use ts::DAY_MS;
 
 #[global_allocator]
@@ -395,89 +395,121 @@ fn build_links(files: &[Mmap], chunk: usize) -> ShardedMap {
         .enumerate()
         .flat_map(|(fi, m)| csv::chunks(m, chunk).into_iter().map(move |(s, e)| (fi, s, e)))
         .collect();
-    // Per job: the pairs, and their keys bucketed by shard.
-    let parsed: Vec<(Vec<(Key, Key)>, Vec<Vec<Key>>)> = jobs
+    // Per job: the number of pairs, and their keys bucketed by shard, each
+    // with the place of its id in the edge list.
+    let parsed: Vec<(usize, Vec<Vec<table::KeyRef>>)> = jobs
         .par_iter()
         .map(|&(fi, s, e)| {
             let file = &files[fi][..];
-            let mut pairs = Vec::with_capacity((e - s) / 16);
-            let mut by_shard: Vec<Vec<Key>> = (0..table::SHARDS).map(|_| Vec::new()).collect();
+            let mut pairs = 0usize;
+            let mut by_shard: Vec<Vec<table::KeyRef>> =
+                (0..table::SHARDS).map(|_| Vec::with_capacity((e - s) / 8 / table::SHARDS + 16)).collect();
             scan::scan::<2>(file, s, e, |f| {
                 let [(as_, ae), (bs, be)] = *f;
                 if as_ != ae && bs != be {
                     let a = scan::pack_at(file, as_, ae);
                     let b = scan::pack_at(file, bs, be);
                     if a != b {
-                        pairs.push((a, b));
-                        by_shard[table::shard_of(keys::hash(a))].push(a);
-                        by_shard[table::shard_of(keys::hash(b))].push(b);
+                        assert!(pairs < (1 << 30), "link chunk too large");
+                        for (k, side) in [(a, 0), (b, 1)] {
+                            let (lo, hi) = split_key(k);
+                            by_shard[table::shard_of(keys::hash(k))].push(table::KeyRef { lo, hi, at: 2 * pairs as u32 + side });
+                        }
+                        pairs += 1;
                     }
                 }
             });
             (pairs, by_shard)
         })
         .collect();
-    let lists: Vec<Vec<Key>> = (0..table::SHARDS)
-        .into_par_iter()
-        .map(|sh| {
-            let mut v = Vec::with_capacity(parsed.iter().map(|p| p.1[sh].len()).sum());
-            for p in &parsed {
-                v.extend_from_slice(&p.1[sh]);
-            }
-            v
-        })
-        .collect();
-    let interner = Interner::build(&lists);
-    let n = interner.keys.len();
-    let edges: Vec<Vec<(u32, u32)>> = parsed
-        .par_iter()
-        .map(|(pairs, _)| pairs.iter().map(|&(a, b)| (interner.id(a), interner.id(b))).collect())
-        .collect();
+    let mut base = Vec::with_capacity(parsed.len());
+    let mut n_pairs = 0usize;
+    for p in &parsed {
+        base.push(2 * n_pairs);
+        n_pairs += p.0;
+    }
+    let (_, by_shard): (Vec<usize>, Vec<Vec<Vec<table::KeyRef>>>) = parsed.into_iter().unzip();
+    // Both ends of every pair as interned ids.
+    let mut edges = vec![0u32; 2 * n_pairs];
+    let uniq = table::intern(&by_shard, &base, &mut edges);
+    let mut offsets = Vec::with_capacity(table::SHARDS + 1);
+    let mut ids: Vec<Key> = Vec::with_capacity(uniq.iter().map(|u| u.len()).sum());
+    for u in &uniq {
+        offsets.push(ids.len());
+        ids.extend_from_slice(u);
+    }
+    offsets.push(ids.len());
+    let n = ids.len();
+    assert!(n < u32::MAX as usize, "too many link IDs");
+    let dense = |e: u32| (offsets[(e >> table::LOCAL_BITS) as usize] + (e & ((1 << table::LOCAL_BITS) - 1)) as usize) as u32;
     log!(t0, "links interned: {n} ids");
 
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    let mut size: Vec<u32> = vec![1; n];
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+    // Union by size with path compression; a node is [parent, size].
+    let mut node: Vec<[u32; 2]> = (0..n as u32).map(|i| [i, 1]).collect();
+    fn find(node: &mut [[u32; 2]], mut x: u32) -> u32 {
         let mut root = x;
-        while parent[root as usize] != root {
-            root = parent[root as usize];
+        while node[root as usize][0] != root {
+            root = node[root as usize][0];
         }
-        while parent[x as usize] != root {
-            let next = parent[x as usize];
-            parent[x as usize] = root;
+        while node[x as usize][0] != root {
+            let next = node[x as usize][0];
+            node[x as usize][0] = root;
             x = next;
         }
         root
     }
-    for v in &edges {
-        for &(ia, ib) in v {
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
-                parent[small as usize] = big;
-                size[big as usize] += size[small as usize];
+    #[inline(always)]
+    fn ahead<T>(v: &[T], i: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(v.as_ptr().wrapping_add(i) as *const i8, _MM_HINT_T0);
+        }
+    }
+    for (i, e) in edges.chunks_exact(2).enumerate() {
+        if let Some(next) = edges.get(2 * i + 16..2 * i + 18) {
+            ahead(&node, dense(next[0]) as usize);
+            ahead(&node, dense(next[1]) as usize);
+        }
+        let ra = find(&mut node, dense(e[0]));
+        let rb = find(&mut node, dense(e[1]));
+        if ra != rb {
+            let (big, small) = if node[ra as usize][1] >= node[rb as usize][1] { (ra, rb) } else { (rb, ra) };
+            node[small as usize][0] = big;
+            node[big as usize][1] += node[small as usize][1];
+        }
+    }
+    log!(t0, "links united");
+    // The smallest ID of each set, kept at its root as an index. From here on
+    // the forest is only read, so the workers can share it.
+    use std::sync::atomic::AtomicU32;
+    let ids = &ids;
+    let node = &node;
+    let root_of = |mut x: u32| {
+        while node[x as usize][0] != x {
+            x = node[x as usize][0];
+        }
+        x
+    };
+    let rel = AtomicOrdering::Relaxed;
+    let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
+    (0..n as u32).into_par_iter().with_min_len(1 << 12).for_each(|i| {
+        let at = &best[root_of(i) as usize];
+        let mut cur = at.load(rel);
+        while cur == u32::MAX || keys::cmp(ids[i as usize], ids[cur as usize]) == std::cmp::Ordering::Less {
+            match at.compare_exchange_weak(cur, i, rel, rel) {
+                Ok(_) => break,
+                Err(c) => cur = c,
             }
         }
-    }
-    let ids = &interner.keys;
-    let mut name: Vec<Key> = vec![0; n];
-    let mut has = vec![false; n];
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        if !has[r] || keys::cmp(ids[i], name[r]) == std::cmp::Ordering::Less {
-            name[r] = ids[i];
-            has[r] = true;
-        }
-    }
+    });
     log!(t0, "links joined");
-    // Every parent is now a root.
     let renamed: Vec<Vec<(Key, Key)>> = (0..table::SHARDS)
         .into_par_iter()
         .map(|sh| {
-            (interner.offsets[sh]..interner.offsets[sh + 1])
+            (offsets[sh]..offsets[sh + 1])
                 .filter_map(|i| {
-                    let nm = name[parent[i] as usize];
+                    let nm = ids[best[root_of(i as u32) as usize].load(rel) as usize];
                     (nm != ids[i]).then_some((ids[i], nm))
                 })
                 .collect()
@@ -485,6 +517,8 @@ fn build_links(files: &[Mmap], chunk: usize) -> ShardedMap {
         .collect();
     let map = ShardedMap::build(&renamed);
     log!(t0, "links table: {} renamed", renamed.iter().map(|v| v.len()).sum::<usize>());
+    // Freeing the scratch memory is left to the exit.
+    std::mem::forget((by_shard, edges, uniq, best, renamed));
     map
 }
 
