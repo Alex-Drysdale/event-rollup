@@ -466,6 +466,7 @@ struct A1 {
     ck: Vec<CRaw>,
 }
 
+#[inline(never)]
 fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
     scan::scan::<7>(file, s, e, |f| {
         let [eid, user, tsf, ingest, etype, product, price] = *f;
@@ -514,6 +515,7 @@ fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
     });
 }
 
+#[inline(never)]
 fn parse_clicks(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
     scan::scan::<4>(file, s, e, |f| {
         let [cid, user, camp, tsf] = *f;
@@ -542,6 +544,7 @@ struct A2 {
     table: Vec<usize>,
 }
 
+#[inline(never)]
 fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mut A2) {
     let n: usize = a1s.iter().map(|a| a.ev[p].len()).sum();
     if n == 0 {
@@ -619,6 +622,7 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
     flush(&batch[..nb], out);
 }
 
+#[inline(never)]
 fn map_clicks(recs: &[CRaw], ctx: &Ctx, links: &ShardedMap, out: &mut A2) {
     for chunk in recs.chunks(BATCH) {
         for r in chunk {
@@ -701,6 +705,7 @@ impl A3 {
     }
 }
 
+#[inline(never)]
 fn process_person(person: Key, evs: &[PRec], clicks: &[CRec], ctx: &Ctx, acc: &mut A3) {
     let base_day = ctx.base.div_euclid(DAY_MS);
     let base_rem = ctx.base.rem_euclid(DAY_MS);
@@ -780,6 +785,7 @@ fn process_person(person: Key, evs: &[PRec], clicks: &[CRec], ctx: &Ctx, acc: &m
     acc.active.clear();
 }
 
+#[inline(never)]
 fn process_partition(q: usize, a2s: &[A2], ctx: &Ctx, acc: &mut A3) {
     let mut ev = std::mem::take(&mut acc.ev);
     let mut ck = std::mem::take(&mut acc.ck);

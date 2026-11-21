@@ -110,37 +110,27 @@ fn finish<const N: usize>(
     quotes: u32,
     emit: &mut impl FnMut(&Fields<N>),
 ) {
+    // Branch-free: which fields are quoted is random, so branches on it would
+    // mispredict. Data lines start after the header, so `s >= 1` and `e - 1`
+    // is in bounds; `s` itself can be the file's length for an empty last field.
     let mut f = [(0usize, 0usize); N];
     let mut s = line_start;
-    if quotes == 0 {
-        for i in 0..N {
-            f[i] = (s, seps[i]);
-            s = seps[i] + 1;
-        }
-    } else {
-        let mut expected = 0u32;
-        for i in 0..N {
-            let e = seps[i];
-            let len = e - s;
-            let fq = len >= 1 && file[s] == b'"';
-            let lq = len >= 1 && file[e - 1] == b'"';
-            if fq != lq {
-                return;
-            }
-            if fq {
-                if len < 2 {
-                    return;
-                }
-                expected += 2;
-                f[i] = (s + 1, e - 1);
-            } else {
-                f[i] = (s, e);
-            }
-            s = e + 1;
-        }
-        if expected != quotes {
-            return;
-        }
+    let mut expected = 0u32;
+    let mut bad = false;
+    let last = file.len() - 1;
+    for i in 0..N {
+        let e = seps[i];
+        let len = e - s;
+        let nonempty = len >= 1;
+        let fq = nonempty & (file[s.min(last)] == b'"');
+        let lq = nonempty & (file[e.max(1) - 1] == b'"');
+        bad |= (fq != lq) | (fq & (len < 2));
+        expected += 2 * fq as u32;
+        f[i] = (s + fq as usize, e - fq as usize);
+        s = e + 1;
+    }
+    if bad | (expected != quotes) {
+        return;
     }
     emit(&f);
 }

@@ -5,7 +5,7 @@
 
 pub const DAY_MS: i64 = 86_400_000;
 
-#[inline]
+#[inline(always)]
 pub fn parse(b: &[u8]) -> Option<i64> {
     let n = b.len();
     // F1 and F2 have '-' at index 4, which no F3 (all digits) can have.
@@ -40,7 +40,7 @@ pub fn parse(b: &[u8]) -> Option<i64> {
 
 /// Digits only, any number of leading zeros; None if empty, not all ASCII
 /// digits, or too big for an i64.
-#[inline]
+#[inline(always)]
 fn parse_f3(b: &[u8]) -> Option<i64> {
     if b.is_empty() {
         return None;
@@ -66,7 +66,7 @@ fn parse_f3(b: &[u8]) -> Option<i64> {
     if v > i64::MAX as u64 { None } else { Some(v as i64) }
 }
 
-#[inline]
+#[inline(always)]
 fn d2(b: &[u8], i: usize) -> Option<u32> {
     let a = b[i].wrapping_sub(b'0');
     let c = b[i + 1].wrapping_sub(b'0');
@@ -93,32 +93,66 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
+    let era = if year >= 0 { year / 400 } else { (year - 399) / 400 };
     let yoe = year - era * 400;
     let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }
 
 /// The first 19 bytes, `YYYY-MM-DDTHH:MM:SS`, as epoch milliseconds.
-#[inline]
+#[inline(always)]
 fn datetime(b: &[u8]) -> Option<i64> {
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    let b: &[u8; 19] = b[..19].try_into().ok()?;
+    let dg = |i: usize| b[i].wrapping_sub(b'0') as u32;
+    let x = [dg(0), dg(1), dg(2), dg(3), dg(5), dg(6), dg(8), dg(9), dg(11), dg(12), dg(14), dg(15), dg(17), dg(18)];
+    let mut bad = (b[4] != b'-') | (b[7] != b'-') | (b[10] != b'T') | (b[13] != b':') | (b[16] != b':');
+    for &v in &x {
+        bad |= v > 9;
+    }
+    let y = x[0] * 1000 + x[1] * 100 + x[2] * 10 + x[3];
+    let mo = x[4] * 10 + x[5];
+    let d = x[6] * 10 + x[7];
+    let h = x[8] * 10 + x[9];
+    let mi = x[10] * 10 + x[11];
+    let s = x[12] * 10 + x[13];
+    bad |= (mo.wrapping_sub(1) > 11) | (d == 0) | (h > 23) | (mi > 59) | (s > 59);
+    if bad {
         return None;
     }
-    let y = (d2(b, 0)? * 100 + d2(b, 2)?) as i64;
-    let mo = d2(b, 5)?;
-    let d = d2(b, 8)?;
-    let h = d2(b, 11)?;
-    let mi = d2(b, 14)?;
-    let s = d2(b, 17)?;
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
-        return None;
-    }
-    let days = days_from_civil(y, mo as i64, d as i64);
+    let days = if (TABLE_FIRST_YEAR..TABLE_FIRST_YEAR + TABLE_YEARS).contains(&y) {
+        // Days to the first of this month and of the next one.
+        let i = ((y - TABLE_FIRST_YEAR) * 12 + mo - 1) as usize;
+        let (first, next) = (MONTH_STARTS[i], MONTH_STARTS[i + 1]);
+        if d as i32 > next - first {
+            return None;
+        }
+        (first + d as i32 - 1) as i64
+    } else {
+        if d > days_in_month(y as i64, mo) {
+            return None;
+        }
+        days_from_civil(y as i64, mo as i64, d as i64)
+    };
     Some((days * 86_400 + (h * 3600 + mi * 60 + s) as i64) * 1000)
 }
+
+const TABLE_FIRST_YEAR: u32 = 1900;
+const TABLE_YEARS: u32 = 300;
+
+/// Days since the epoch of the first of each month, 1900-01 to 2200-01.
+static MONTH_STARTS: [i32; TABLE_YEARS as usize * 12 + 1] = {
+    let mut t = [0i32; TABLE_YEARS as usize * 12 + 1];
+    let mut i = 0;
+    while i < t.len() {
+        let y = (TABLE_FIRST_YEAR as usize + i / 12) as i64;
+        let m = (i % 12 + 1) as i64;
+        t[i] = days_from_civil(y, m, 1) as i32;
+        i += 1;
+    }
+    t
+};
 
 #[cfg(test)]
 mod tests {
@@ -149,5 +183,29 @@ mod tests {
         assert_eq!(parse(b"9223372036854775808"), None);
         assert_eq!(parse(b"0000000000000000000000000000000000000000x"), None);
         assert_eq!(parse(b"2026-10-03T10:00:00+02:00x"), None);
+    }
+
+    #[test]
+    fn calendar_exhaustive() {
+        use super::{days_from_civil, days_in_month};
+        for y in 1895i64..=2205 {
+            for m in 1u32..=12 {
+                for d in 1u32..=31 {
+                    let text = format!("{y:04}-{m:02}-{d:02}T13:14:15Z");
+                    let got = parse(text.as_bytes());
+                    if d <= days_in_month(y, m) {
+                        let want = (days_from_civil(y, m as i64, d as i64) * 86_400 + 13 * 3600 + 14 * 60 + 15) * 1000;
+                        assert_eq!(got, Some(want), "{text}");
+                    } else {
+                        assert_eq!(got, None, "{text}");
+                    }
+                }
+            }
+        }
+        assert_eq!(parse(b"1900-02-29T00:00:00Z"), None);
+        assert!(parse(b"2000-02-29T00:00:00Z").is_some());
+        assert_eq!(parse(b"2100-02-29T00:00:00Z"), None);
+        assert_eq!(parse(b"1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse(b"0000-03-01T00:00:00Z"), Some(days_from_civil(0, 3, 1) * 86_400_000));
     }
 }
