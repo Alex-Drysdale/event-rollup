@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use memmap2::Mmap;
-use parquet::data_type::ByteArray;
 use rayon::prelude::*;
 
 use keys::{Key, KeyMap};
@@ -218,11 +217,22 @@ macro_rules! log {
 
 /// Runs `jobs` jobs on `n` workers that each own one accumulator.
 fn workers<A: Send>(n: usize, jobs: usize, init: impl Fn() -> A + Sync, work: impl Fn(&mut A, usize) + Sync) -> Vec<A> {
+    workers_then(n, jobs, init, work, |_, _| {})
+}
+
+/// `workers`, and each worker calls `finish(acc, worker index)` when no jobs are left.
+fn workers_then<A: Send>(
+    n: usize,
+    jobs: usize,
+    init: impl Fn() -> A + Sync,
+    work: impl Fn(&mut A, usize) + Sync,
+    finish: impl Fn(&mut A, usize) + Sync,
+) -> Vec<A> {
     let next = AtomicUsize::new(0);
     let mut out: Vec<Option<A>> = (0..n).map(|_| None).collect();
     rayon::scope(|s| {
-        for slot in out.iter_mut() {
-            let (next, init, work) = (&next, &init, &work);
+        for (w, slot) in out.iter_mut().enumerate() {
+            let (next, init, work, finish) = (&next, &init, &work, &finish);
             s.spawn(move |_| {
                 let mut a = init();
                 loop {
@@ -232,6 +242,7 @@ fn workers<A: Send>(n: usize, jobs: usize, init: impl Fn() -> A + Sync, work: im
                     }
                     work(&mut a, j);
                 }
+                finish(&mut a, w);
                 *slot = Some(a);
             });
         }
@@ -917,79 +928,62 @@ fn process_partition(q: usize, a2s: &[A2], ctx: &Ctx, acc: &mut A3) {
 // Output
 
 fn write_user_daily(dir: &Path, part: usize, rows: &[UserRow], ctx: &Ctx) {
-    let mut ids = Vec::with_capacity(rows.len());
-    let mut days = Vec::with_capacity(rows.len());
-    let mut sessions = Vec::with_capacity(rows.len());
-    let mut events = Vec::with_capacity(rows.len());
-    let mut revenue = Vec::with_capacity(rows.len());
-    let mut tops = Vec::with_capacity(rows.len());
-    let mut defs = Vec::with_capacity(rows.len());
-    let cats: Vec<ByteArray> = ctx.cats.iter().map(|c| ByteArray::from(c.clone())).collect();
-    for r in rows {
-        ids.push(ByteArray::from(keys::to_vec(r.person)));
-        days.push(r.day);
-        sessions.push(r.sessions as i64);
-        events.push(r.events as i64);
-        revenue.push(r.revenue as i64);
-        if r.top == NO_CAT {
-            defs.push(0);
-        } else {
-            defs.push(1);
-            tops.push(cats[r.top as usize].clone());
-        }
+    use out::{Column, Kind};
+    let n = rows.len();
+    let mut ids = Column::new("user_id", Kind::Str, n);
+    let mut days = Column::new("day", Kind::Date, n);
+    let mut sessions = Column::new("sessions", Kind::I64, n);
+    let mut events = Column::new("events", Kind::I64, n);
+    let mut revenue = Column::new("revenue_cents", Kind::I64, n);
+    let mut tops = Column::new("top_category", Kind::OptStr, n);
+    let mut name = Vec::with_capacity(32);
+    for (i, r) in rows.iter().enumerate() {
+        name.clear();
+        keys::write_bytes(r.person, &mut name);
+        ids.str(&name);
+        days.i32(r.day);
+        sessions.i64(r.sessions as i64);
+        events.i64(r.events as i64);
+        revenue.i64(r.revenue as i64);
+        tops.opt_str(i, (r.top != NO_CAT).then(|| ctx.cats[r.top as usize].as_slice()));
     }
-    out::write(
-        &dir.join(format!("part-{part:05}.parquet")),
-        out::USER_SCHEMA,
-        vec![
-            out::Col::Str(ids),
-            out::Col::I32(days),
-            out::Col::I64(sessions),
-            out::Col::I64(events),
-            out::Col::I64(revenue),
-            out::Col::OptStr(tops, defs),
-        ],
-    );
+    out::write(&dir.join(format!("part-{part:05}.parquet")), n, &[ids, days, sessions, events, revenue, tops]);
 }
 
 fn write_campaign_daily(dir: &Path, camp: &[[u64; 4]], ctx: &Ctx) {
-    let mut ids = Vec::new();
-    let mut channels = Vec::new();
-    let mut days = Vec::new();
-    let mut cols: [Vec<i64>; 4] = Default::default();
-    for c in 0..=ctx.ncamp() {
-        for d in 0..ctx.ndays {
+    use out::{Column, Kind};
+    let cells: Vec<(usize, usize)> = (0..=ctx.ncamp())
+        .flat_map(|c| (0..ctx.ndays).map(move |d| (c, d)))
+        .filter(|&(c, d)| {
             let cell = camp[c * ctx.ndays + d];
-            if cell[0] == 0 && cell[3] == 0 {
-                continue;
-            }
-            if c == ctx.ncamp() {
-                ids.push(ByteArray::from(&b"organic"[..]));
-                channels.push(ByteArray::from(&b"organic"[..]));
-            } else {
-                ids.push(ByteArray::from(ctx.camp_ids[c].clone()));
-                channels.push(ByteArray::from(ctx.camp_channels[c].clone()));
-            }
-            days.push((ctx.day0 + d as i64) as i32);
-            for (col, v) in cols.iter_mut().zip(cell) {
-                col.push(v as i64);
-            }
+            cell[0] != 0 || cell[3] != 0
+        })
+        .collect();
+    let n = cells.len();
+    let mut ids = Column::new("campaign_id", Kind::Str, n);
+    let mut channels = Column::new("channel", Kind::Str, n);
+    let mut days = Column::new("day", Kind::Date, n);
+    let mut cols = [
+        Column::new("sessions", Kind::I64, n),
+        Column::new("purchasing_sessions", Kind::I64, n),
+        Column::new("revenue_cents", Kind::I64, n),
+        Column::new("assisted_sessions", Kind::I64, n),
+    ];
+    for &(c, d) in &cells {
+        if c == ctx.ncamp() {
+            ids.str(b"organic");
+            channels.str(b"organic");
+        } else {
+            ids.str(&ctx.camp_ids[c]);
+            channels.str(&ctx.camp_channels[c]);
+        }
+        days.i32((ctx.day0 + d as i64) as i32);
+        for (col, v) in cols.iter_mut().zip(camp[c * ctx.ndays + d]) {
+            col.i64(v as i64);
         }
     }
     let [s, p, r, a] = cols;
-    out::write(
-        &dir.join("part-00000.parquet"),
-        out::CAMPAIGN_SCHEMA,
-        vec![
-            out::Col::Str(ids),
-            out::Col::Str(channels),
-            out::Col::I32(days),
-            out::Col::I64(s),
-            out::Col::I64(p),
-            out::Col::I64(r),
-            out::Col::I64(a),
-        ],
-    );
+    out::write(&dir.join("part-00000.parquet"), n, &[ids, channels, days, s, p, r, a]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,14 +1098,25 @@ fn main() {
     let n_surv: usize = a2s.iter().map(|a| a.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     log!(t0, "phase 2: {} surviving events", n_surv);
 
-    // Phase 3: sessions and attribution per person partition.
-    let a3s = workers(nw, nq, || A3::new(&ctx), |acc, q| process_partition(q, &a2s, &ctx, acc));
-    log!(t0, "phase 3: {} user-day rows", a3s.iter().map(|a| a.rows.len()).sum::<usize>());
-
+    // Phase 3: sessions and attribution per person partition. Each worker
+    // writes its own user_daily file as soon as it runs out of partitions
+    // (worker 0 always writes one, so the table has a file even when empty).
     let ud_dir = cfg.out.join("user_daily");
     let cd_dir = cfg.out.join("campaign_daily");
     fs::create_dir_all(&ud_dir).expect("create user_daily");
     fs::create_dir_all(&cd_dir).expect("create campaign_daily");
+    let a3s = workers_then(
+        nw,
+        nq,
+        || A3::new(&ctx),
+        |acc, q| process_partition(q, &a2s, &ctx, acc),
+        |acc, w| {
+            if w == 0 || !acc.rows.is_empty() {
+                write_user_daily(&ud_dir, w, &acc.rows, &ctx);
+            }
+        },
+    );
+    log!(t0, "phase 3: {} user-day rows", a3s.iter().map(|a| a.rows.len()).sum::<usize>());
     let mut camp = vec![[0u64; 4]; (ctx.ncamp() + 1) * ctx.ndays];
     for a in &a3s {
         for (x, y) in camp.iter_mut().zip(&a.camp) {
@@ -1120,17 +1125,7 @@ fn main() {
             }
         }
     }
-    let non_empty: Vec<&A3> = a3s.iter().filter(|a| !a.rows.is_empty()).collect();
-    rayon::join(
-        || {
-            if non_empty.is_empty() {
-                write_user_daily(&ud_dir, 0, &[], &ctx);
-            } else {
-                non_empty.par_iter().enumerate().for_each(|(i, a)| write_user_daily(&ud_dir, i, &a.rows, &ctx));
-            }
-        },
-        || write_campaign_daily(&cd_dir, &camp, &ctx),
-    );
+    write_campaign_daily(&cd_dir, &camp, &ctx);
     if std::env::var_os("SS_CHECK").is_some() {
         let us: u64 = a3s.iter().flat_map(|a| a.rows.iter()).map(|r| r.sessions as u64).sum();
         let ur: u64 = a3s.iter().flat_map(|a| a.rows.iter()).map(|r| r.revenue).sum();

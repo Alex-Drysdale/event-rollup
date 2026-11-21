@@ -1,83 +1,258 @@
-//! Parquet output through the parquet crate's low-level writer: no
-//! compression, no dictionary, no statistics, one row group per file.
+//! A minimal Parquet writer: one row group, one uncompressed PLAIN data page
+//! (v1) per column, no dictionary, no statistics. The footer is Thrift
+//! compact protocol, written by hand.
+//!
+//! Columns are REQUIRED except `OptStr`, whose definition levels are written
+//! as RLE/bit-packed-hybrid bit-packed runs of width 1.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
-use parquet::basic::Compression;
-use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
-
-pub enum Col {
-    Str(Vec<ByteArray>),
-    OptStr(Vec<ByteArray>, Vec<i16>),
-    I32(Vec<i32>),
-    I64(Vec<i64>),
+pub enum Kind {
+    Str,
+    OptStr,
+    Date,
+    I64,
 }
 
-fn props() -> Arc<WriterProperties> {
-    Arc::new(
-        WriterProperties::builder()
-            .set_writer_version(WriterVersion::PARQUET_1_0)
-            .set_compression(Compression::UNCOMPRESSED)
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .set_offset_index_disabled(true)
-            .set_max_row_group_row_count(None)
-            .set_data_page_size_limit(usize::MAX / 4)
-            .set_write_batch_size(1 << 20)
-            .build(),
-    )
+/// One column's values, already PLAIN-encoded.
+pub struct Column {
+    pub name: &'static str,
+    pub kind: Kind,
+    /// PLAIN values (non-null only for OptStr).
+    pub data: Vec<u8>,
+    /// For OptStr: one bit per row, 1 = present, LSB first.
+    pub present: Vec<u8>,
 }
 
-/// Writes one file whose columns appear in `schema` in the same order as `cols`.
-pub fn write(path: &Path, schema: &str, cols: Vec<Col>) {
-    let schema = Arc::new(parse_message_type(schema).expect("schema"));
-    let file = BufWriter::with_capacity(1 << 22, File::create(path).expect("create parquet"));
-    let mut w = SerializedFileWriter::new(file, schema, props()).expect("writer");
-    let mut rg = w.next_row_group().expect("row group");
-    let mut cols = cols.into_iter();
-    while let Some(mut cw) = rg.next_column().expect("column") {
-        match cols.next().expect("column count") {
-            Col::Str(v) => {
-                cw.typed::<ByteArrayType>().write_batch(&v, None, None).expect("write");
-            }
-            Col::OptStr(v, def) => {
-                cw.typed::<ByteArrayType>().write_batch(&v, Some(&def), None).expect("write");
-            }
-            Col::I32(v) => {
-                cw.typed::<Int32Type>().write_batch(&v, None, None).expect("write");
-            }
-            Col::I64(v) => {
-                cw.typed::<Int64Type>().write_batch(&v, None, None).expect("write");
-            }
-        }
-        cw.close().expect("close column");
+impl Column {
+    pub fn new(name: &'static str, kind: Kind, rows: usize) -> Column {
+        let per = match kind {
+            Kind::Str | Kind::OptStr => 14,
+            Kind::Date => 4,
+            Kind::I64 => 8,
+        };
+        Column { name, kind, data: Vec::with_capacity(rows * per), present: Vec::new() }
     }
-    rg.close().expect("close row group");
-    let inner = w.into_inner().expect("finish");
-    inner.into_inner().ok().expect("flush");
+    #[inline(always)]
+    pub fn str(&mut self, s: &[u8]) {
+        self.data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        self.data.extend_from_slice(s);
+    }
+    /// For OptStr: row `i` (rows pushed in order) is `s` or null.
+    #[inline(always)]
+    pub fn opt_str(&mut self, i: usize, s: Option<&[u8]>) {
+        if i % 8 == 0 {
+            self.present.push(0);
+        }
+        if let Some(s) = s {
+            *self.present.last_mut().unwrap() |= 1 << (i % 8);
+            self.str(s);
+        }
+    }
+    #[inline(always)]
+    pub fn i32(&mut self, v: i32) {
+        self.data.extend_from_slice(&v.to_le_bytes());
+    }
+    #[inline(always)]
+    pub fn i64(&mut self, v: i64) {
+        self.data.extend_from_slice(&v.to_le_bytes());
+    }
 }
 
-pub const USER_SCHEMA: &str = "message user_daily {
-  REQUIRED BYTE_ARRAY user_id (UTF8);
-  REQUIRED INT32 day (DATE);
-  REQUIRED INT64 sessions;
-  REQUIRED INT64 events;
-  REQUIRED INT64 revenue_cents;
-  OPTIONAL BYTE_ARRAY top_category (UTF8);
-}";
+// Thrift compact protocol.
+const T_I32: u8 = 5;
+const T_I64: u8 = 6;
+const T_BINARY: u8 = 8;
+const T_LIST: u8 = 9;
+const T_STRUCT: u8 = 12;
 
-pub const CAMPAIGN_SCHEMA: &str = "message campaign_daily {
-  REQUIRED BYTE_ARRAY campaign_id (UTF8);
-  REQUIRED BYTE_ARRAY channel (UTF8);
-  REQUIRED INT32 day (DATE);
-  REQUIRED INT64 sessions;
-  REQUIRED INT64 purchasing_sessions;
-  REQUIRED INT64 revenue_cents;
-  REQUIRED INT64 assisted_sessions;
-}";
+struct Thrift {
+    buf: Vec<u8>,
+    last: Vec<i16>,
+}
+
+impl Thrift {
+    fn new() -> Thrift {
+        Thrift { buf: Vec::new(), last: vec![0] }
+    }
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.buf.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        self.buf.push(v as u8);
+    }
+    fn zigzag(&mut self, v: i64) {
+        self.varint(((v << 1) ^ (v >> 63)) as u64);
+    }
+    fn field(&mut self, id: i16, ty: u8) {
+        let last = self.last.last_mut().unwrap();
+        let delta = id - *last;
+        *last = id;
+        if (1..=15).contains(&delta) {
+            self.buf.push(((delta as u8) << 4) | ty);
+        } else {
+            self.buf.push(ty);
+            self.zigzag(id as i64);
+        }
+    }
+    fn i32(&mut self, id: i16, v: i32) {
+        self.field(id, T_I32);
+        self.zigzag(v as i64);
+    }
+    fn i64(&mut self, id: i16, v: i64) {
+        self.field(id, T_I64);
+        self.zigzag(v);
+    }
+    fn bin(&mut self, id: i16, s: &[u8]) {
+        self.field(id, T_BINARY);
+        self.varint(s.len() as u64);
+        self.buf.extend_from_slice(s);
+    }
+    fn list(&mut self, id: i16, elem: u8, n: usize) {
+        self.field(id, T_LIST);
+        self.list_header(elem, n);
+    }
+    fn list_header(&mut self, elem: u8, n: usize) {
+        if n < 15 {
+            self.buf.push(((n as u8) << 4) | elem);
+        } else {
+            self.buf.push(0xF0 | elem);
+            self.varint(n as u64);
+        }
+    }
+    /// Starts a struct as field `id` (or as a list element when `id` is None).
+    fn begin(&mut self, id: Option<i16>) {
+        if let Some(id) = id {
+            self.field(id, T_STRUCT);
+        }
+        self.last.push(0);
+    }
+    fn end(&mut self) {
+        self.buf.push(0);
+        self.last.pop();
+    }
+}
+
+// Parquet enums.
+const TYPE_INT32: i32 = 1;
+const TYPE_INT64: i32 = 2;
+const TYPE_BYTE_ARRAY: i32 = 6;
+const REQUIRED: i32 = 0;
+const OPTIONAL: i32 = 1;
+const CONVERTED_UTF8: i32 = 0;
+const CONVERTED_DATE: i32 = 6;
+const ENC_PLAIN: i32 = 0;
+const ENC_RLE: i32 = 3;
+
+fn physical(k: &Kind) -> i32 {
+    match k {
+        Kind::Str | Kind::OptStr => TYPE_BYTE_ARRAY,
+        Kind::Date => TYPE_INT32,
+        Kind::I64 => TYPE_INT64,
+    }
+}
+
+/// Writes a Parquet file with `rows` rows.
+pub fn write(path: &Path, rows: usize, cols: &[Column]) {
+    let mut file: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.data.len() + c.present.len() + 64).sum::<usize>() + 4096);
+    file.extend_from_slice(b"PAR1");
+    let mut chunks = Vec::new(); // (data_page_offset, total size)
+    for c in cols {
+        let mut levels = Vec::new();
+        if let Kind::OptStr = c.kind {
+            // Bit-packed run of ceil(rows / 8) groups of 8 values, width 1.
+            let groups = rows.div_ceil(8);
+            let mut run = Thrift::new();
+            run.varint(((groups as u64) << 1) | 1);
+            let mut body = run.buf;
+            body.extend_from_slice(&c.present[..groups]);
+            levels.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            levels.extend_from_slice(&body);
+        }
+        let page_size = levels.len() + c.data.len();
+        let mut h = Thrift::new();
+        h.i32(1, 0); // DATA_PAGE
+        h.i32(2, page_size as i32);
+        h.i32(3, page_size as i32);
+        h.begin(Some(5));
+        h.i32(1, rows as i32);
+        h.i32(2, ENC_PLAIN);
+        h.i32(3, ENC_RLE);
+        h.i32(4, ENC_RLE);
+        h.end();
+        h.buf.push(0);
+        let offset = file.len();
+        file.extend_from_slice(&h.buf);
+        file.extend_from_slice(&levels);
+        file.extend_from_slice(&c.data);
+        chunks.push((offset, file.len() - offset));
+    }
+
+    let mut m = Thrift::new();
+    m.i32(1, 1);
+    m.list(2, T_STRUCT, cols.len() + 1);
+    m.begin(None);
+    m.bin(4, b"schema");
+    m.i32(5, cols.len() as i32);
+    m.end();
+    for c in cols {
+        m.begin(None);
+        m.i32(1, physical(&c.kind));
+        m.i32(3, if let Kind::OptStr = c.kind { OPTIONAL } else { REQUIRED });
+        m.bin(4, c.name.as_bytes());
+        match c.kind {
+            Kind::Str | Kind::OptStr => {
+                m.i32(6, CONVERTED_UTF8);
+                m.begin(Some(10)); // LogicalType
+                m.begin(Some(1)); // STRING
+                m.end();
+                m.end();
+            }
+            Kind::Date => {
+                m.i32(6, CONVERTED_DATE);
+                m.begin(Some(10));
+                m.begin(Some(6)); // DATE
+                m.end();
+                m.end();
+            }
+            Kind::I64 => {}
+        }
+        m.end();
+    }
+    m.i64(3, rows as i64);
+    m.list(4, T_STRUCT, 1);
+    m.begin(None);
+    m.list(1, T_STRUCT, cols.len());
+    let total: usize = chunks.iter().map(|c| c.1).sum();
+    for (c, &(offset, size)) in cols.iter().zip(&chunks) {
+        m.begin(None);
+        m.i64(2, offset as i64);
+        m.begin(Some(3));
+        m.i32(1, physical(&c.kind));
+        m.list(2, T_I32, 2);
+        m.zigzag(ENC_PLAIN as i64);
+        m.zigzag(ENC_RLE as i64);
+        m.list(3, T_BINARY, 1);
+        m.varint(c.name.len() as u64);
+        m.buf.extend_from_slice(c.name.as_bytes());
+        m.i32(4, 0); // UNCOMPRESSED
+        m.i64(5, rows as i64);
+        m.i64(6, size as i64);
+        m.i64(7, size as i64);
+        m.i64(9, offset as i64);
+        m.end();
+        m.end();
+    }
+    m.i64(2, total as i64);
+    m.i64(3, rows as i64);
+    m.end();
+    m.bin(6, b"event-rollup");
+    m.buf.push(0);
+    file.extend_from_slice(&m.buf);
+    file.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
+    file.extend_from_slice(b"PAR1");
+    File::create(path).and_then(|mut f| f.write_all(&file)).expect("write parquet");
+}
