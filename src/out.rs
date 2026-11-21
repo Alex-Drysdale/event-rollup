@@ -13,6 +13,7 @@ pub enum Kind {
     Str,
     OptStr,
     Date,
+    I32,
     I64,
 }
 
@@ -30,7 +31,7 @@ impl Column {
     pub fn new(name: &'static str, kind: Kind, rows: usize) -> Column {
         let per = match kind {
             Kind::Str | Kind::OptStr => 14,
-            Kind::Date => 4,
+            Kind::Date | Kind::I32 => 4,
             Kind::I64 => 8,
         };
         Column { name, kind, data: Vec::with_capacity(rows * per), present: Vec::new() }
@@ -150,7 +151,7 @@ const ENC_RLE: i32 = 3;
 fn physical(k: &Kind) -> i32 {
     match k {
         Kind::Str | Kind::OptStr => TYPE_BYTE_ARRAY,
-        Kind::Date => TYPE_INT32,
+        Kind::Date | Kind::I32 => TYPE_INT32,
         Kind::I64 => TYPE_INT64,
     }
 }
@@ -218,7 +219,7 @@ pub fn write(path: &Path, rows: usize, cols: &[Column]) {
                 m.end();
                 m.end();
             }
-            Kind::I64 => {}
+            Kind::I32 | Kind::I64 => {}
         }
         m.end();
     }
@@ -254,5 +255,9 @@ pub fn write(path: &Path, rows: usize, cols: &[Column]) {
     file.extend_from_slice(&m.buf);
     file.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
     file.extend_from_slice(b"PAR1");
+    let t = std::time::Instant::now();
     File::create(path).and_then(|mut f| f.write_all(&file)).expect("write parquet");
+    if std::env::var_os("SS_DEBUG").is_some() {
+        eprintln!("  write_all {} bytes: {:?}", file.len(), t.elapsed());
+    }
 }

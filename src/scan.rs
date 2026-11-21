@@ -46,6 +46,9 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+/// How far ahead of the scan to prefetch input.
+const PREFETCH: usize = 1024;
+
 /// Field byte ranges `(start, end)` into the file, quotes removed.
 pub type Fields<const N: usize> = [(usize, usize); N];
 
@@ -64,6 +67,13 @@ pub fn scan<const N: usize>(file: &[u8], start: usize, end: usize, mut emit: imp
     let mut pad: [u8; 64];
     while b < end {
         let (nl, cm, qt) = if b + 64 <= end {
+            #[cfg(target_arch = "x86_64")]
+            if b + PREFETCH < end {
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    _mm_prefetch(file.as_ptr().add(b + PREFETCH) as *const i8, _MM_HINT_T0);
+                }
+            }
             unsafe { masks(file.as_ptr().add(b)) }
         } else {
             let n = end - b;

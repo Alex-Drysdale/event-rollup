@@ -957,8 +957,8 @@ fn write_user_daily(dir: &Path, part: usize, rows: &[UserRow], ctx: &Ctx) {
     let n = rows.len();
     let mut ids = Column::new("user_id", Kind::Str, n);
     let mut days = Column::new("day", Kind::Date, n);
-    let mut sessions = Column::new("sessions", Kind::I64, n);
-    let mut events = Column::new("events", Kind::I64, n);
+    let mut sessions = Column::new("sessions", Kind::I32, n);
+    let mut events = Column::new("events", Kind::I32, n);
     let mut revenue = Column::new("revenue_cents", Kind::I64, n);
     let mut tops = Column::new("top_category", Kind::OptStr, n);
     let mut name = Vec::with_capacity(32);
@@ -967,8 +967,8 @@ fn write_user_daily(dir: &Path, part: usize, rows: &[UserRow], ctx: &Ctx) {
         keys::write_bytes(r.person, &mut name);
         ids.str(&name);
         days.i32(r.day);
-        sessions.i64(r.sessions as i64);
-        events.i64(r.events as i64);
+        sessions.i32(r.sessions as i32);
+        events.i32(r.events as i32);
         revenue.i64(r.revenue as i64);
         tops.opt_str(i, (r.top != NO_CAT).then(|| ctx.cats[r.top as usize].as_slice()));
     }
@@ -1137,10 +1137,23 @@ fn main() {
         nw,
         nq,
         || A3::new(&ctx),
-        |acc, q| process_partition(q, &a2s, &ctx, acc),
+        |acc, q| {
+            let t = Instant::now();
+            let n: usize = a2s.iter().map(|a| a.ev[q].len()).sum();
+            process_partition(q, &a2s, &ctx, acc);
+            if std::env::var_os("SS_DEBUG").is_some() && t.elapsed().as_millis() > 15 {
+                log!(t0, "phase 3 partition {q}: {n} events, {} ms", t.elapsed().as_millis());
+            }
+        },
         |acc, w| {
+            if std::env::var_os("SS_DEBUG").is_some() {
+                log!(t0, "phase 3 worker {w} done");
+            }
             if w == 0 || !acc.rows.is_empty() {
                 write_user_daily(&ud_dir, w, &acc.rows, &ctx);
+            }
+            if std::env::var_os("SS_DEBUG").is_some() {
+                log!(t0, "phase 3 worker {w} wrote {} rows", acc.rows.len());
             }
         },
     );
