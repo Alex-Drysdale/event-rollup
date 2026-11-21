@@ -163,7 +163,7 @@ impl Cfg {
             out: out.into(),
             threads: env_usize("SS_THREADS").unwrap_or(threads).max(1),
             chunk: env_usize("SS_CHUNK").unwrap_or(4 << 20).max(1),
-            pbits: env_usize("SS_PBITS").unwrap_or(9) as u32,
+            pbits: env_usize("SS_PBITS").unwrap_or(10) as u32,
             qbits: env_usize("SS_QBITS").unwrap_or(9) as u32,
         }
     }
@@ -541,7 +541,7 @@ fn parse_clicks(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
 struct A2 {
     ev: Vec<Vec<PRec>>,
     ck: Vec<Vec<CRec>>,
-    table: Vec<usize>,
+    table: Vec<(u64, usize)>,
 }
 
 #[inline(never)]
@@ -554,24 +554,28 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
     let mask = cap - 1;
     let table = &mut out.table;
     table.clear();
-    table.resize(cap, 0);
-    // Keep, per event_id, the copy with the smallest ingest_ts.
+    table.resize(cap, (0, 0));
+    // Keep, per event_id, the copy with the smallest ingest_ts. Slots hold
+    // (hash, record address); records are only read when the hashes match.
     for a in a1s {
         for r in &a.ev[p] {
             let k = r.eid();
-            let mut h = keys::hash(k) as usize & mask;
+            let hk = keys::hash(k);
+            let mut h = hk as usize & mask;
             loop {
-                let t = table[h];
+                let (th, t) = table[h];
                 if t == 0 {
-                    table[h] = r as *const ERec as usize;
+                    table[h] = (hk, r as *const ERec as usize);
                     break;
                 }
-                let tr = unsafe { &*(t as *const ERec) };
-                if tr.eid() == k {
-                    if r.ingest < tr.ingest {
-                        table[h] = r as *const ERec as usize;
+                if th == hk {
+                    let tr = unsafe { &*(t as *const ERec) };
+                    if tr.eid() == k {
+                        if r.ingest < tr.ingest {
+                            table[h].1 = r as *const ERec as usize;
+                        }
+                        break;
                     }
-                    break;
                 }
                 h = (h + 1) & mask;
             }
@@ -597,15 +601,18 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
                 continue;
             }
             let k = r.eid();
-            let mut h = keys::hash(k) as usize & mask;
+            let hk = keys::hash(k);
+            let mut h = hk as usize & mask;
             let me = r as *const ERec as usize;
             let winner = loop {
-                let t = out.table[h];
-                if t == me {
-                    break true;
-                }
-                if unsafe { &*(t as *const ERec) }.eid() == k {
-                    break false;
+                let (th, t) = out.table[h];
+                if th == hk {
+                    if t == me {
+                        break true;
+                    }
+                    if unsafe { &*(t as *const ERec) }.eid() == k {
+                        break false;
+                    }
                 }
                 h = (h + 1) & mask;
             };
