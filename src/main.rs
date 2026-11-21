@@ -4,6 +4,7 @@ mod csv;
 mod keys;
 mod out;
 mod scan;
+mod scatter;
 mod table;
 mod ts;
 
@@ -42,25 +43,54 @@ fn join_key(lo: u64, hi: u64) -> Key {
     (lo as u128) | ((hi as u128) << 64)
 }
 
-/// A well-formed event line with a non-empty event_id, before dedup. `ok`:
-/// the line is valid and not late, so it survives if it is the kept copy.
+/// A well-formed event line with a non-empty event_id, before dedup, in 48
+/// bytes. `meta` packs ingest_ts (49 bits, milliseconds after year 0, so
+/// order is preserved; unparseable sorts last), the category (14 bits) and
+/// `ok` (1 bit): the line is valid and not late, so it survives if it is the
+/// kept copy.
 #[derive(Clone, Copy)]
 struct ERec {
     eid_lo: u64,
     eid_hi: u64,
     user_lo: u64,
     user_hi: u64,
-    ingest: i64,
+    meta: u64,
     ts: u32,
     price: u32,
-    cat: u16,
-    ok: bool,
 }
+
+const INGEST_BITS: u32 = 49;
+const INGEST_MAX: u64 = (1 << INGEST_BITS) - 1;
+/// Milliseconds from 0000-01-01 to the epoch.
+const INGEST_OFFSET: i64 = 62_167_219_200_000;
+const CAT_BITS: u32 = 14;
+const CAT_NONE: u64 = (1 << CAT_BITS) - 1;
 
 impl ERec {
     #[inline(always)]
     fn eid(&self) -> Key {
         join_key(self.eid_lo, self.eid_hi)
+    }
+    #[inline(always)]
+    fn ingest_code(&self) -> u64 {
+        self.meta >> (CAT_BITS + 1)
+    }
+    #[inline(always)]
+    fn ok(&self) -> bool {
+        self.meta & 1 != 0
+    }
+    #[inline(always)]
+    fn cat(&self) -> u16 {
+        let c = (self.meta >> 1) & CAT_NONE;
+        if c == CAT_NONE { NO_CAT } else { c as u16 }
+    }
+}
+
+#[inline(always)]
+fn ingest_code(ingest: Option<i64>) -> u64 {
+    match ingest {
+        Some(t) => (t.saturating_add(INGEST_OFFSET)).clamp(0, INGEST_MAX as i64 - 1) as u64,
+        None => INGEST_MAX,
     }
 }
 
@@ -215,12 +245,8 @@ macro_rules! log {
     };
 }
 
-/// Runs `jobs` jobs on `n` workers that each own one accumulator.
-fn workers<A: Send>(n: usize, jobs: usize, init: impl Fn() -> A + Sync, work: impl Fn(&mut A, usize) + Sync) -> Vec<A> {
-    workers_then(n, jobs, init, work, |_, _| {})
-}
-
-/// `workers`, and each worker calls `finish(acc, worker index)` when no jobs are left.
+/// Runs `jobs` jobs on `n` workers that each own one accumulator; each
+/// worker calls `finish(acc, worker index)` when no jobs are left.
 fn workers_then<A: Send>(
     n: usize,
     jobs: usize,
@@ -337,7 +363,7 @@ fn load_products(path: &Path) -> (KeyMap<u16>, Vec<Vec<u8>>, u16) {
     cats.push(b"unknown".to_vec());
     cats.sort();
     cats.dedup();
-    assert!(cats.len() < NO_CAT as usize, "too many categories");
+    assert!(cats.len() < CAT_NONE as usize, "too many categories");
     let idx = |c: &[u8]| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u16;
     let mut map = KeyMap::default();
     for (k, c) in &rows {
@@ -478,7 +504,7 @@ enum Kind {
 }
 
 struct A1 {
-    ev: Vec<Vec<ERec>>,
+    ev: scatter::Scatter<ERec>,
     ck: Vec<CRaw>,
 }
 
@@ -497,11 +523,9 @@ fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
             eid_hi,
             user_lo: 0,
             user_hi: 0,
-            ingest: ingest.unwrap_or(i64::MAX),
+            meta: (ingest_code(ingest) << (CAT_BITS + 1)) | (CAT_NONE << 1),
             ts: 0,
             price: 0,
-            cat: NO_CAT,
-            ok: false,
         };
         'validate: {
             let Some(ingest) = ingest else { break 'validate };
@@ -520,14 +544,15 @@ fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
             if purchase {
                 let Some(p) = parse_price(field(price)) else { break 'validate };
                 rec.price = p;
-                rec.cat = *ctx.prod_map.get(&scan::pack_at(file, product.0, product.1)).unwrap_or(&ctx.unknown_cat);
+                let cat = *ctx.prod_map.get(&scan::pack_at(file, product.0, product.1)).unwrap_or(&ctx.unknown_cat);
+                rec.meta = (rec.meta & !(CAT_NONE << 1)) | ((cat as u64) << 1);
             }
             rec.ts = (t - ctx.base) as u32;
             (rec.user_lo, rec.user_hi) = split_key(scan::pack_at(file, user.0, user.1));
-            rec.ok = true;
+            rec.meta |= 1;
         }
         let p = ctx.ppart(rec.eid());
-        acc.ev[p].push(rec);
+        acc.ev.push(p, rec);
     });
 }
 
@@ -562,7 +587,7 @@ struct A2 {
 
 #[inline(never)]
 fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mut A2) {
-    let n: usize = a1s.iter().map(|a| a.ev[p].len()).sum();
+    let n: usize = a1s.iter().map(|a| a.ev.outs[p].len()).sum();
     if n == 0 {
         return;
     }
@@ -574,7 +599,7 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
     // Keep, per event_id, the copy with the smallest ingest_ts. Slots hold
     // (hash, record address); records are only read when the hashes match.
     for a in a1s {
-        for r in &a.ev[p] {
+        for r in &a.ev.outs[p] {
             let k = r.eid();
             let hk = keys::hash(k);
             let mut h = hk as usize & mask;
@@ -587,7 +612,7 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
                 if th == hk {
                     let tr = unsafe { &*(t as *const ERec) };
                     if tr.eid() == k {
-                        if r.ingest < tr.ingest {
+                        if r.ingest_code() < tr.ingest_code() {
                             table[h].1 = r as *const ERec as usize;
                         }
                         break;
@@ -612,8 +637,8 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
         }
     };
     for a in a1s {
-        for r in &a.ev[p] {
-            if !r.ok {
+        for r in &a.ev.outs[p] {
+            if !r.ok() {
                 continue;
             }
             let k = r.eid();
@@ -633,7 +658,7 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
                 h = (h + 1) & mask;
             };
             if winner {
-                batch[nb] = (join_key(r.user_lo, r.user_hi), r.ts, r.price, r.cat);
+                batch[nb] = (join_key(r.user_lo, r.user_hi), r.ts, r.price, r.cat());
                 nb += 1;
                 if nb == BATCH {
                     flush(&batch, out);
@@ -1048,13 +1073,10 @@ fn main() {
             log!(t0, "links: {} table slots", l.slots());
             l
         });
-        let a1s = workers(
+        let a1s = workers_then(
             env_usize("SS_PARSE_THREADS").unwrap_or(nw),
             jobs.len(),
-            || A1 {
-                ev: (0..np).map(|_| Vec::with_capacity(ev_reserve)).collect(),
-                ck: Vec::with_capacity(ck_reserve),
-            },
+            || A1 { ev: scatter::Scatter::new(np, ev_reserve), ck: Vec::with_capacity(ck_reserve) },
             |acc, j| {
                 let (kind, fi, s, e) = jobs[j];
                 match kind {
@@ -1062,11 +1084,16 @@ fn main() {
                     Kind::Clicks => parse_clicks(&ck_files[fi], s, e, &ctx, acc),
                 }
             },
+            |acc, _| acc.ev.finish(),
         );
         log!(t0, "parsed");
         (handle.join().unwrap(), a1s)
     });
-    let n_ev: usize = a1s.iter().map(|a| a.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
+    if std::env::var_os("SS_DEBUG").is_some() {
+        let aligned = a1s.iter().flat_map(|a| a.ev.outs.iter()).filter(|v| v.as_ptr() as usize % 64 == 0).count();
+        log!(t0, "scatter buffers 64-byte aligned: {aligned} of {}", a1s.len() * np);
+    }
+    let n_ev: usize = a1s.iter().map(|a| a.ev.outs.iter().map(|v| v.len()).sum::<usize>()).sum();
     let n_ck: usize = a1s.iter().map(|a| a.ck.len()).sum();
     log!(t0, "phase 1: {} event lines, {} valid clicks", n_ev, n_ck);
 
@@ -1078,7 +1105,7 @@ fn main() {
         .collect();
     let ev_reserve2 = n_ev / nw / nq * 5 / 4 + 16;
     let ck_reserve2 = n_ck / nw / nq * 5 / 4 + 16;
-    let a2s = workers(
+    let a2s = workers_then(
         nw,
         np + ck_jobs.len(),
         || A2 {
@@ -1094,6 +1121,7 @@ fn main() {
                 map_clicks(&a1s[w].ck[s..e], &ctx, &links, acc);
             }
         },
+        |_, _| {},
     );
     let n_surv: usize = a2s.iter().map(|a| a.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     log!(t0, "phase 2: {} surviving events", n_surv);
