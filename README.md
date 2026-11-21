@@ -73,7 +73,8 @@ The Parquet files are written by a small hand-written writer (`src/out.rs`).
 Without Docker: `cargo build --release`, then
 `DATA_DIR=... OUTPUT_DIR=... target/release/sessions`. Timings for each phase go
 to stderr. Tuning knobs for testing (environment): `SS_CHUNK` (bytes per parse
-chunk), `SS_PBITS` / `SS_QBITS` (log2 partition counts), `SS_THREADS`,
+chunk), `SS_PBITS` / `SS_QBITS` (log2 partition counts; by default 10 / 9, or
+11 / 11 above 3 GB of events), `SS_THREADS`,
 `SS_INLINE` (force IDs longer than N bytes onto the interned path), `SS_KEEP=1`
 (do not release parsed input pages early), `SS_CHECK=1` (assert the table
 invariants).

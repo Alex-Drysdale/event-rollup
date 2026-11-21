@@ -124,8 +124,16 @@ struct Cfg {
     out: PathBuf,
     threads: usize,
     chunk: usize,
-    pbits: u32,
-    qbits: u32,
+    /// log2 of the partition counts, when given (see `part_bits`).
+    pbits: Option<u32>,
+    qbits: Option<u32>,
+}
+
+/// log2 of the event_id and person partition counts. Past about 3 GB of
+/// events more partitions keep each one's dedup table and sort in cache.
+fn part_bits(cfg: &Cfg, ev_bytes: usize) -> (u32, u32) {
+    let (p, q) = if ev_bytes > 3 << 30 { (11, 11) } else { (10, 9) };
+    (cfg.pbits.unwrap_or(p), cfg.qbits.unwrap_or(q))
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -154,8 +162,8 @@ impl Cfg {
             out: out.into(),
             threads: env_usize("SS_THREADS").unwrap_or(threads).max(1),
             chunk: env_usize("SS_CHUNK").unwrap_or(4 << 20).max(1),
-            pbits: env_usize("SS_PBITS").unwrap_or(10) as u32,
-            qbits: env_usize("SS_QBITS").unwrap_or(9) as u32,
+            pbits: env_usize("SS_PBITS").map(|b| b as u32),
+            qbits: env_usize("SS_QBITS").map(|b| b as u32),
         }
     }
 }
@@ -1068,6 +1076,8 @@ fn main() {
         || (load_campaigns(&cfg.data.join("campaigns.csv")), load_products(&cfg.data.join("products.csv"))),
         || (map_dir(&cfg.data.join("events")), map_dir(&cfg.data.join("clicks"))),
     );
+    let ev_bytes: usize = ev_files.iter().map(|m| m.len()).sum();
+    let (pbits, qbits) = part_bits(&cfg, ev_bytes);
     let ctx = Ctx {
         ws,
         we,
@@ -1081,11 +1091,11 @@ fn main() {
         prod_map,
         cats,
         unknown_cat,
-        pbits: cfg.pbits,
-        qbits: cfg.qbits,
+        pbits,
+        qbits,
     };
-    let np = 1usize << cfg.pbits;
-    let nq = 1usize << cfg.qbits;
+    let np = 1usize << pbits;
+    let nq = 1usize << qbits;
     log!(t0, "lookups: {} campaigns, {} products, {} categories", ctx.camp_ids.len(), ctx.prod_map.len(), ctx.cats.len());
 
     // Phase 1: links, in parallel with parsing events and clicks.
