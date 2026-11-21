@@ -29,7 +29,7 @@ pub fn set_inline_max(n: usize) {
 }
 
 #[inline]
-fn inline_max() -> usize {
+pub fn inline_max() -> usize {
     INLINE_MAX.load(AtomicOrdering::Relaxed)
 }
 

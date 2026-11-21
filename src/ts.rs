@@ -8,18 +8,17 @@ pub const DAY_MS: i64 = 86_400_000;
 #[inline]
 pub fn parse(b: &[u8]) -> Option<i64> {
     let n = b.len();
-    if n == 0 {
-        return None;
-    }
-    if b[0].is_ascii_digit() && b.iter().all(|c| c.is_ascii_digit()) {
-        return parse_f3(b);
-    }
-    if n == 20 {
-        if b[19] != b'Z' {
+    // F1 and F2 have '-' at index 4, which no F3 (all digits) can have.
+    if n >= 20 && b[4] == b'-' {
+        if n == 20 {
+            if b[19] != b'Z' {
+                return None;
+            }
+            return datetime(b);
+        }
+        if n != 25 {
             return None;
         }
-        datetime(b)
-    } else if n == 25 {
         let sign = match b[19] {
             b'+' => 1i64,
             b'-' => -1i64,
@@ -34,17 +33,35 @@ pub fn parse(b: &[u8]) -> Option<i64> {
             return None;
         }
         let local = datetime(b)?;
-        Some(local - sign * (oh * 60 + om) * 60_000)
-    } else {
-        None
+        return Some(local - sign * (oh * 60 + om) * 60_000);
     }
+    parse_f3(b)
 }
 
+/// Digits only, any number of leading zeros; None if empty, not all ASCII
+/// digits, or too big for an i64.
 #[inline]
 fn parse_f3(b: &[u8]) -> Option<i64> {
+    if b.is_empty() {
+        return None;
+    }
     let mut v: u64 = 0;
+    if b.len() <= 18 {
+        for &c in b {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as u64;
+        }
+        return Some(v as i64);
+    }
     for &c in b {
-        v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add(d as u64)?;
     }
     if v > i64::MAX as u64 { None } else { Some(v as i64) }
 }
@@ -126,5 +143,11 @@ mod tests {
             assert_eq!(parse(bad), None, "{:?}", String::from_utf8_lossy(bad));
         }
         assert!(parse(b"2028-02-29T10:00:00Z").is_some());
+        assert_eq!(parse(b"00000000001791071890000"), Some(1791071890000));
+        assert_eq!(parse(b"0000000000000000000000000000001791071890000"), Some(1791071890000));
+        assert_eq!(parse(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse(b"9223372036854775808"), None);
+        assert_eq!(parse(b"0000000000000000000000000000000000000000x"), None);
+        assert_eq!(parse(b"2026-10-03T10:00:00+02:00x"), None);
     }
 }
