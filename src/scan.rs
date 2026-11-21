@@ -11,7 +11,7 @@
 //! and their number is even. Then each odd quote and the next wrap one whole
 //! field, and no field has a quote anywhere else.
 
-use crate::keys::{self, Key};
+use crate::keys::{self, Id, Key};
 
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
@@ -218,9 +218,57 @@ pub fn pack_at(file: &[u8], s: usize, e: usize) -> Key {
     }
 }
 
+/// `keys::pack_id` of `file[s..e]`: the 6-bit codes of up to 10 bytes are
+/// gathered with two bit extractions when the bytes can be read 16 at once.
+#[inline(always)]
+pub fn pack_id_at(file: &[u8], s: usize, e: usize) -> Id {
+    let len = e - s;
+    if len <= keys::id_inline_max() && s + 16 <= file.len() {
+        let raw = u128::from_be_bytes(file[s..s + 16].try_into().unwrap());
+        let mask = if len == 0 { 0 } else { !0u128 << (8 * (16 - len)) };
+        let v = raw & mask;
+        // Every byte of the field has bit 5 set and bit 7 clear.
+        const HIGH: u128 = 0xA0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0_A0A0;
+        const WANT: u128 = 0x2020_2020_2020_2020_2020_2020_2020_2020;
+        if v & HIGH == WANT & mask {
+            let hi = pext64((v >> 64) as u64, 0x5F5F_5F5F_5F5F_5F5F);
+            let lo = pext64((v as u64) >> 48, 0x5F5F);
+            return hi << 16 | lo << 4 | len as u64;
+        }
+    }
+    keys::pack_id(&file[s..e])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast ID packer against the reference one, at several offsets from
+    /// the ends of the buffer (so both the 16-byte read and the tail path run).
+    #[test]
+    fn pack_id_matches() {
+        let _guard = keys::tests::LIMIT.lock().unwrap();
+        let cases = keys::tests::id_cases();
+        for limit in [10usize, 3, 15] {
+            keys::set_inline_max(limit);
+            for c in &cases {
+                let want = keys::pack_id(c);
+                assert_eq!(keys::id_to_vec(want), *c);
+                for (before, after) in [(0usize, 0usize), (3, 1), (1, 15), (0, 16), (5, 40), (2, 7)] {
+                    let mut buf = vec![0xFFu8; before];
+                    buf.extend_from_slice(c);
+                    buf.extend(std::iter::repeat_n(b'z', after));
+                    assert_eq!(pack_id_at(&buf, before, before + c.len()), want, "{c:?} +{before} -{after}");
+                    // The bytes after the field must not matter.
+                    for x in buf[before + c.len()..].iter_mut() {
+                        *x = 0x80;
+                    }
+                    assert_eq!(pack_id_at(&buf, before, before + c.len()), want, "{c:?} +{before} -{after}");
+                }
+            }
+        }
+        keys::set_inline_max(15);
+    }
 
     fn lines<const N: usize>(text: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
@@ -309,6 +357,7 @@ mod tests {
 
     #[test]
     fn pack_matches() {
+        let _guard = keys::tests::LIMIT.lock().unwrap();
         let text = b"abc,,0123456789abcde,0123456789abcdef,xyz";
         let mut s = 0;
         for (i, &c) in text.iter().enumerate() {

@@ -16,7 +16,7 @@ use std::time::Instant;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use keys::{Key, KeyMap};
+use keys::{Id, Key, KeyMap};
 use table::ShardedMap;
 use ts::DAY_MS;
 
@@ -33,27 +33,15 @@ const BATCH: usize = 16;
 // ---------------------------------------------------------------------------
 // Records
 
-#[inline(always)]
-fn split_key(k: Key) -> (u64, u64) {
-    (k as u64, (k >> 64) as u64)
-}
-
-#[inline(always)]
-fn join_key(lo: u64, hi: u64) -> Key {
-    (lo as u128) | ((hi as u128) << 64)
-}
-
-/// A well-formed event line with a non-empty event_id, before dedup, in 48
+/// A well-formed event line with a non-empty event_id, before dedup, in 32
 /// bytes. `meta` packs ingest_ts (49 bits, milliseconds after year 0, so
 /// order is preserved; unparseable sorts last), the category (14 bits) and
 /// `ok` (1 bit): the line is valid and not late, so it survives if it is the
 /// kept copy.
 #[derive(Clone, Copy)]
 struct ERec {
-    eid_lo: u64,
-    eid_hi: u64,
-    user_lo: u64,
-    user_hi: u64,
+    eid: Id,
+    user: Id,
     meta: u64,
     ts: u32,
     price: u32,
@@ -67,10 +55,6 @@ const CAT_BITS: u32 = 14;
 const CAT_NONE: u64 = (1 << CAT_BITS) - 1;
 
 impl ERec {
-    #[inline(always)]
-    fn eid(&self) -> Key {
-        join_key(self.eid_lo, self.eid_hi)
-    }
     #[inline(always)]
     fn ingest_code(&self) -> u64 {
         self.meta >> (CAT_BITS + 1)
@@ -97,10 +81,8 @@ fn ingest_code(ingest: Option<i64>) -> u64 {
 /// A valid click, before its user is mapped to a person.
 #[derive(Clone, Copy)]
 struct CRaw {
-    c_lo: u64,
-    c_hi: u64,
-    u_lo: u64,
-    u_hi: u64,
+    cid: Id,
+    user: Id,
     ts: u32,
     camp: u32,
 }
@@ -110,43 +92,22 @@ struct CRaw {
 #[derive(Clone, Copy)]
 struct PRec {
     key: u64,
-    p_lo: u64,
-    p_hi: u64,
+    person: Id,
     price: u32,
     cat: u16,
-}
-
-impl PRec {
-    #[inline(always)]
-    fn person(&self) -> Key {
-        join_key(self.p_lo, self.p_hi)
-    }
 }
 
 /// A valid click keyed like `PRec`.
 #[derive(Clone, Copy)]
 struct CRec {
     key: u64,
-    p_lo: u64,
-    p_hi: u64,
-    c_lo: u64,
-    c_hi: u64,
+    person: Id,
+    cid: Id,
     camp: u32,
 }
 
-impl CRec {
-    #[inline(always)]
-    fn person(&self) -> Key {
-        join_key(self.p_lo, self.p_hi)
-    }
-    #[inline(always)]
-    fn cid(&self) -> Key {
-        join_key(self.c_lo, self.c_hi)
-    }
-}
-
 struct UserRow {
-    person: Key,
+    person: Id,
     day: i32,
     sessions: u32,
     events: u32,
@@ -222,14 +183,14 @@ impl Ctx {
         self.camp_ids.len()
     }
     #[inline(always)]
-    fn ppart(&self, k: Key) -> usize {
-        if self.pbits == 0 { 0 } else { (keys::hash(k) >> (64 - self.pbits)) as usize }
+    fn ppart(&self, k: Id) -> usize {
+        if self.pbits == 0 { 0 } else { (keys::id_hash(k) >> (64 - self.pbits)) as usize }
     }
     /// The person partition and the sort key's high bits, from one hash.
     /// The partition uses bits below the key's, so they stay independent.
     #[inline(always)]
-    fn qpart_key(&self, person: Key, ts: u32) -> (usize, u64) {
-        let h = keys::hash(person);
+    fn qpart_key(&self, person: Id, ts: u32) -> (usize, u64) {
+        let h = keys::id_hash(person);
         let q = if self.qbits == 0 { 0 } else { ((h >> 7) & ((1u64 << self.qbits) - 1)) as usize };
         ((q), (h >> self.ts_bits << self.ts_bits) | ts as u64)
     }
@@ -407,13 +368,12 @@ fn build_links(files: &[Mmap], chunk: usize) -> ShardedMap {
             scan::scan::<2>(file, s, e, |f| {
                 let [(as_, ae), (bs, be)] = *f;
                 if as_ != ae && bs != be {
-                    let a = scan::pack_at(file, as_, ae);
-                    let b = scan::pack_at(file, bs, be);
+                    let a = scan::pack_id_at(file, as_, ae);
+                    let b = scan::pack_id_at(file, bs, be);
                     if a != b {
                         assert!(pairs < (1 << 30), "link chunk too large");
                         for (k, side) in [(a, 0), (b, 1)] {
-                            let (lo, hi) = split_key(k);
-                            by_shard[table::shard_of(keys::hash(k))].push(table::KeyRef { lo, hi, at: 2 * pairs as u32 + side });
+                            by_shard[table::shard_of(keys::id_hash(k))].push(table::KeyRef { k, at: 2 * pairs as u32 + side });
                         }
                         pairs += 1;
                     }
@@ -433,7 +393,7 @@ fn build_links(files: &[Mmap], chunk: usize) -> ShardedMap {
     let mut edges = vec![0u32; 2 * n_pairs];
     let uniq = table::intern(&by_shard, &base, &mut edges);
     let mut offsets = Vec::with_capacity(table::SHARDS + 1);
-    let mut ids: Vec<Key> = Vec::with_capacity(uniq.iter().map(|u| u.len()).sum());
+    let mut ids: Vec<Id> = Vec::with_capacity(uniq.iter().map(|u| u.len()).sum());
     for u in &uniq {
         offsets.push(ids.len());
         ids.extend_from_slice(u);
@@ -496,7 +456,7 @@ fn build_links(files: &[Mmap], chunk: usize) -> ShardedMap {
     (0..n as u32).into_par_iter().with_min_len(1 << 12).for_each(|i| {
         let at = &best[root_of(i) as usize];
         let mut cur = at.load(rel);
-        while cur == u32::MAX || keys::cmp(ids[i as usize], ids[cur as usize]) == std::cmp::Ordering::Less {
+        while cur == u32::MAX || keys::id_cmp(ids[i as usize], ids[cur as usize]) == std::cmp::Ordering::Less {
             match at.compare_exchange_weak(cur, i, rel, rel) {
                 Ok(_) => break,
                 Err(c) => cur = c,
@@ -504,7 +464,7 @@ fn build_links(files: &[Mmap], chunk: usize) -> ShardedMap {
         }
     });
     log!(t0, "links joined");
-    let renamed: Vec<Vec<(Key, Key)>> = (0..table::SHARDS)
+    let renamed: Vec<Vec<(Id, Id)>> = (0..table::SHARDS)
         .into_par_iter()
         .map(|sh| {
             (offsets[sh]..offsets[sh + 1])
@@ -565,12 +525,9 @@ fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
         }
         let field = |r: (usize, usize)| &file[r.0..r.1];
         let ingest = ts::parse(field(ingest));
-        let (eid_lo, eid_hi) = split_key(scan::pack_at(file, eid.0, eid.1));
         let mut rec = ERec {
-            eid_lo,
-            eid_hi,
-            user_lo: 0,
-            user_hi: 0,
+            eid: scan::pack_id_at(file, eid.0, eid.1),
+            user: 0,
             meta: (ingest_code(ingest) << (CAT_BITS + 1)) | (CAT_NONE << 1),
             ts: 0,
             price: 0,
@@ -596,10 +553,10 @@ fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
                 rec.meta = (rec.meta & !(CAT_NONE << 1)) | ((cat as u64) << 1);
             }
             rec.ts = (t - ctx.base) as u32;
-            (rec.user_lo, rec.user_hi) = split_key(scan::pack_at(file, user.0, user.1));
+            rec.user = scan::pack_id_at(file, user.0, user.1);
             rec.meta |= 1;
         }
-        let p = ctx.ppart(rec.eid());
+        let p = ctx.ppart(rec.eid);
         acc.ev.push(p, rec);
     });
 }
@@ -618,9 +575,9 @@ fn parse_clicks(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
         let Some(&camp) = ctx.camp_map.get(&scan::pack_at(file, camp.0, camp.1)) else {
             return;
         };
-        let (u_lo, u_hi) = split_key(scan::pack_at(file, user.0, user.1));
-        let (c_lo, c_hi) = split_key(scan::pack_at(file, cid.0, cid.1));
-        acc.ck.push(CRaw { c_lo, c_hi, u_lo, u_hi, ts: (t - ctx.base) as u32, camp });
+        let user = scan::pack_id_at(file, user.0, user.1);
+        let cid = scan::pack_id_at(file, cid.0, cid.1);
+        acc.ck.push(CRaw { cid, user, ts: (t - ctx.base) as u32, camp });
     });
 }
 
@@ -669,8 +626,8 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
     for a in a1s {
         for r in &a.ev.outs[p] {
             idx += 1;
-            let k = r.eid();
-            let hk = keys::hash(k);
+            let k = r.eid;
+            let hk = keys::id_hash(k);
             // The partition is the top bits of the hash and the slot the low
             // ones: take the tag from the middle.
             let tag = ((hk >> 20) as u32) & !imask;
@@ -684,7 +641,7 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
                 if t & !imask == tag {
                     let j = (t & imask) as usize - 1;
                     let tr = rec_at(j);
-                    if tr.eid() == k {
+                    if tr.eid == k {
                         let loser = if r.ingest_code() < tr.ingest_code() {
                             table[h] = tag | idx;
                             j
@@ -700,17 +657,16 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
         }
     }
     // Survivors in record order: kept copies that are valid and not late.
-    let mut batch: [(Key, u32, u32, u16); BATCH] = [(0, 0, 0, 0); BATCH];
+    let mut batch: [(Id, u32, u32, u16); BATCH] = [(0, 0, 0, 0); BATCH];
     let mut nb = 0;
-    let flush = |batch: &[(Key, u32, u32, u16)], out: &mut A2| {
+    let flush = |batch: &[(Id, u32, u32, u16)], out: &mut A2| {
         for b in batch {
             links.prefetch(b.0);
         }
         for &(user, ts, price, cat) in batch {
             let person = links.get_or_self(user);
             let (q, key) = ctx.qpart_key(person, ts);
-            let (p_lo, p_hi) = split_key(person);
-            out.ev[q].push(PRec { key, p_lo, p_hi, price, cat });
+            out.ev[q].push(PRec { key, person, price, cat });
         }
     };
     let mut i = 0usize;
@@ -721,7 +677,7 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
             if !r.ok() || lost {
                 continue;
             }
-            batch[nb] = (join_key(r.user_lo, r.user_hi), r.ts, r.price, r.cat());
+            batch[nb] = (r.user, r.ts, r.price, r.cat());
             nb += 1;
             if nb == BATCH {
                 flush(&batch, out);
@@ -736,13 +692,12 @@ fn dedup_partition(p: usize, a1s: &[A1], ctx: &Ctx, links: &ShardedMap, out: &mu
 fn map_clicks(recs: &[CRaw], ctx: &Ctx, links: &ShardedMap, out: &mut A2) {
     for chunk in recs.chunks(BATCH) {
         for r in chunk {
-            links.prefetch(join_key(r.u_lo, r.u_hi));
+            links.prefetch(r.user);
         }
         for r in chunk {
-            let person = links.get_or_self(join_key(r.u_lo, r.u_hi));
+            let person = links.get_or_self(r.user);
             let (q, key) = ctx.qpart_key(person, r.ts);
-            let (p_lo, p_hi) = split_key(person);
-            out.ck[q].push(CRec { key, p_lo, p_hi, c_lo: r.c_lo, c_hi: r.c_hi, camp: r.camp });
+            out.ck[q].push(CRec { key, person, cid: r.cid, camp: r.camp });
         }
     }
 }
@@ -803,7 +758,7 @@ impl A3 {
         }
     }
 
-    fn flush_day(&mut self, person: Key, day: i64, sessions: u32, events: u32, revenue: u64) {
+    fn flush_day(&mut self, person: Id, day: i64, sessions: u32, events: u32, revenue: u64) {
         let mut top = NO_CAT;
         let mut best = 0u64;
         for &(c, s) in &self.cats {
@@ -818,7 +773,7 @@ impl A3 {
 }
 
 #[inline(never)]
-fn process_person(person: Key, evs: &[PRec], clicks: &[CRec], ctx: &Ctx, acc: &mut A3) {
+fn process_person(person: Id, evs: &[PRec], clicks: &[CRec], ctx: &Ctx, acc: &mut A3) {
     let base_day = ctx.base.div_euclid(DAY_MS);
     let base_rem = ctx.base.rem_euclid(DAY_MS);
     let ndays = ctx.ndays;
@@ -968,39 +923,37 @@ fn process_partition(q: usize, a2s: &[A2], ctx: &Ctx, acc: &mut A3) {
         a.key.cmp(&b.key)
     });
     bucket_sort(a2s.iter().map(|a| &a.ck[q][..]), &mut ck, &mut acc.counts_sort, |r| r.key, |a, b| {
-        a.key.cmp(&b.key).then_with(|| keys::cmp(b.cid(), a.cid()))
+        a.key.cmp(&b.key).then_with(|| keys::id_cmp(b.cid, a.cid))
     });
     if !ev.is_empty() {
         let tb = ctx.ts_bits;
         // Two people whose hashes agree in the key bits would interleave: detect
         // that and fall back to sorting by the full person ID.
-        let collide_ev = ev.windows(2).any(|w| (w[0].key ^ w[1].key) >> tb == 0 && w[0].person() != w[1].person());
-        let collide_ck = ck.windows(2).any(|w| (w[0].key ^ w[1].key) >> tb == 0 && w[0].person() != w[1].person());
+        let collide_ev = ev.windows(2).any(|w| (w[0].key ^ w[1].key) >> tb == 0 && w[0].person != w[1].person);
+        let collide_ck = ck.windows(2).any(|w| (w[0].key ^ w[1].key) >> tb == 0 && w[0].person != w[1].person);
         if collide_ev || collide_ck {
-            ev.sort_unstable_by_key(|r| (r.key >> tb, r.p_hi, r.p_lo, r.key));
+            ev.sort_unstable_by_key(|r| (r.key >> tb, r.person, r.key));
             ck.sort_unstable_by(|a, b| {
-                (a.key >> tb, a.p_hi, a.p_lo, a.key)
-                    .cmp(&(b.key >> tb, b.p_hi, b.p_lo, b.key))
-                    .then_with(|| keys::cmp(b.cid(), a.cid()))
+                (a.key >> tb, a.person, a.key).cmp(&(b.key >> tb, b.person, b.key)).then_with(|| keys::id_cmp(b.cid, a.cid))
             });
         }
-        // People in (hash bits, id) order on both sides.
-        let ord_e = |r: &PRec| (r.key >> tb, r.p_hi, r.p_lo);
-        let ord_c = |r: &CRec| (r.key >> tb, r.p_hi, r.p_lo);
+        // People in (hash bits, id as an integer) order on both sides.
+        let ord_e = |r: &PRec| (r.key >> tb, r.person);
+        let ord_c = |r: &CRec| (r.key >> tb, r.person);
         let mut ci = 0;
         let mut i = 0;
         while i < ev.len() {
-            let p = ev[i].person();
+            let p = ev[i].person;
             let pe = ord_e(&ev[i]);
             let mut j = i + 1;
-            while j < ev.len() && ev[j].person() == p {
+            while j < ev.len() && ev[j].person == p {
                 j += 1;
             }
             while ci < ck.len() && ord_c(&ck[ci]) < pe {
                 ci += 1;
             }
             let cs = ci;
-            while ci < ck.len() && ck[ci].person() == p {
+            while ci < ck.len() && ck[ci].person == p {
                 ci += 1;
             }
             process_person(p, &ev[i..j], &ck[cs..ci], ctx, acc);
@@ -1026,7 +979,7 @@ fn write_user_daily(dir: &Path, part: usize, rows: &[UserRow], ctx: &Ctx) {
     let mut name = Vec::with_capacity(32);
     for (i, r) in rows.iter().enumerate() {
         name.clear();
-        keys::write_bytes(r.person, &mut name);
+        keys::id_write_bytes(r.person, &mut name);
         ids.str(&name);
         days.i32(r.day);
         sessions.i32(r.sessions as i32);

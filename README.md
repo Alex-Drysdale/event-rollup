@@ -23,7 +23,7 @@ binary reads the CSV inputs in `/data`, applies `rules.md`, and writes
    time on the newline/comma/quote bit masks of the 128 bytes at the line start
    (AVX-512 compares), checking the quote rules with mask arithmetic; long
    lines fall back to a scalar splitter. Timestamps F1/F2/F3 are validated fully
-   (calendar, offsets, overflow). Each well-formed event line becomes a compact
+   (calendar, offsets, overflow). Each well-formed event line becomes a 32-byte
    record (packed event_id, ingest_ts, a "valid and not late" flag, user, ts,
    price, category) scattered by a hash of event_id. Clicks are validated (ID,
    user, ts in the click window, known campaign). The pages of a chunk are
@@ -43,9 +43,15 @@ binary reads the CSV inputs in `/data`, applies `rules.md`, and writes
 6. **Output.** Parquet files written in parallel, uncompressed, `day` as
    `INT32 (DATE)`.
 
-IDs of up to 15 bytes are packed into a `u128` (bytes big-endian, length in the
-low byte) so integer order is byte-wise string order; longer IDs fall back to an
-interner. Timestamps are stored as `u32` milliseconds after `window_start - 7 days`.
+Event, user and click IDs are carried as a `u64`. An ID of up to 10 bytes, all
+of them digits, lower-case letters or other bytes of `0x20-0x3F` / `0x60-0x7F`,
+is packed 6 bits a byte (left-aligned, length in the low 4 bits), which is
+one-to-one and keeps integer order equal to byte-wise string order. Any other
+ID (upper case, longer, other bytes) is interned and compared through its
+bytes, so equality, the person name and the click tie-break stay exact.
+Product and campaign keys for the lookup tables are a `u128` (up to 15 bytes
+inline). Timestamps are stored as `u32` milliseconds after
+`window_start - 7 days`.
 
 ## Libraries
 
