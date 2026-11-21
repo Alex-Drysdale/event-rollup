@@ -1,4 +1,4 @@
-//! Shopping Sessions pipeline. See rules.md for the spec and README.md for the design.
+//! Event pipeline. See README.md for the design.
 
 mod csv;
 mod keys;

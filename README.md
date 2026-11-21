@@ -1,6 +1,6 @@
-# Shopping Sessions — native Rust pipeline
+# event-rollup — native Rust CSV aggregation
 
-Builders Buildathon, Databricks "Shopping Sessions" track. A single static Rust
+A single static Rust
 binary reads the CSV inputs in `/data`, applies `rules.md`, and writes
 `/output/user_daily/` and `/output/campaign_daily/` as Parquet. No SQL engine.
 
@@ -46,7 +46,7 @@ interner. Timestamps are stored as `u32` milliseconds after `window_start - 7 da
 
 ## Build and run
 
-    docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+    docker buildx build --platform linux/amd64 --load -t event-rollup:latest .
 
 Without Docker: `cargo build --release`, then
 `DATA_DIR=... OUTPUT_DIR=... target/release/sessions`. Timings for each phase go

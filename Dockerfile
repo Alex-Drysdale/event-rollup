@@ -1,4 +1,4 @@
-# Shopping Sessions: native Rust pipeline.
+# Native Rust pipeline.
 FROM rust:1.100-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
