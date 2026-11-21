@@ -349,27 +349,40 @@ fn load_campaigns(path: &Path) -> (KeyMap<u32>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
 }
 
 fn load_products(path: &Path) -> (KeyMap<u16>, Vec<Vec<u8>>, u16) {
-    let mut rows: Vec<(Key, Vec<u8>)> = Vec::new();
+    // Categories are numbered as they first appear, then renumbered in
+    // byte-wise order, so that a smaller index is a smaller name.
+    let mut cats: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
+    let mut rows: Vec<(Key, u32)> = Vec::new();
     if let Some(m) = map_file(path) {
-        for (s, e) in csv::chunks(&m, usize::MAX / 2) {
-            csv::for_lines(&m[s..e], |line| {
-                if let Some([id, cat]) = csv::split::<2>(line) {
-                    rows.push((keys::pack(id), cat.to_vec()));
-                }
+        let m = &m[..];
+        let mut seen: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+        seen.insert(b"unknown", 0);
+        rows.reserve(m.len() / 8);
+        for (s, e) in csv::chunks(m, usize::MAX / 2) {
+            scan::scan::<2>(m, s, e, |f| {
+                let [(is, ie), (cs, ce)] = *f;
+                let cat = &m[cs..ce];
+                let c = *seen.entry(cat).or_insert_with(|| {
+                    cats.push(cat.to_vec());
+                    cats.len() as u32 - 1
+                });
+                rows.push((scan::pack_at(m, is, ie), c));
             });
         }
     }
-    let mut cats: Vec<Vec<u8>> = rows.iter().map(|r| r.1.clone()).collect();
-    cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
     assert!(cats.len() < CAT_NONE as usize, "too many categories");
-    let idx = |c: &[u8]| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u16;
-    let mut map = KeyMap::default();
-    for (k, c) in &rows {
-        map.entry(*k).or_insert_with(|| idx(c));
+    let mut order: Vec<u32> = (0..cats.len() as u32).collect();
+    order.sort_by(|&a, &b| cats[a as usize].cmp(&cats[b as usize]));
+    let mut rank = vec![0u16; cats.len()];
+    for (new, &old) in order.iter().enumerate() {
+        rank[old as usize] = new as u16;
     }
-    let unknown = idx(b"unknown");
+    let mut map = KeyMap::with_capacity_and_hasher(rows.len(), Default::default());
+    for &(k, c) in &rows {
+        map.entry(k).or_insert(rank[c as usize]);
+    }
+    let unknown = rank[0];
+    let cats = order.iter().map(|&i| std::mem::take(&mut cats[i as usize])).collect();
     (map, cats, unknown)
 }
 
@@ -1030,6 +1043,20 @@ fn write_campaign_daily(dir: &Path, camp: &[[u64; 4]], ctx: &Ctx) {
 fn main() {
     let t0 = Instant::now();
     let cfg = Cfg::load();
+    // The links are built on their own small pool from the very start, so
+    // they overlap the lookups and the parse instead of waiting for a worker.
+    let link_handle = {
+        let (dir, chunk) = (cfg.data.join("links"), cfg.chunk);
+        std::thread::spawn(move || {
+            let lk_files = map_dir(&dir);
+            let link_pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+            let l = link_pool.install(|| build_links(&lk_files, chunk));
+            log!(t0, "links: {} table slots", l.slots());
+            // Dropping the mappings and the pool is left to the exit.
+            std::mem::forget((lk_files, link_pool));
+            l
+        })
+    };
     rayon::ThreadPoolBuilder::new().num_threads(cfg.threads).build_global().unwrap();
     let nw = cfg.threads;
 
@@ -1040,11 +1067,10 @@ fn main() {
     let day0 = ws.div_euclid(DAY_MS);
     let ndays = ((we - 1).div_euclid(DAY_MS) - day0 + 1) as usize;
 
-    let (camp_map, camp_ids, camp_channels) = load_campaigns(&cfg.data.join("campaigns.csv"));
-    let (prod_map, cats, unknown_cat) = load_products(&cfg.data.join("products.csv"));
-    let ev_files = map_dir(&cfg.data.join("events"));
-    let ck_files = map_dir(&cfg.data.join("clicks"));
-    let lk_files = map_dir(&cfg.data.join("links"));
+    let (((camp_map, camp_ids, camp_channels), (prod_map, cats, unknown_cat)), (ev_files, ck_files)) = rayon::join(
+        || (load_campaigns(&cfg.data.join("campaigns.csv")), load_products(&cfg.data.join("products.csv"))),
+        || (map_dir(&cfg.data.join("events")), map_dir(&cfg.data.join("clicks"))),
+    );
     let ctx = Ctx {
         ws,
         we,
@@ -1078,16 +1104,8 @@ fn main() {
     let ck_bytes: usize = ck_files.iter().map(|m| m.len()).sum();
     let ev_reserve = ev_bytes / 64 / nw / np * 5 / 4 + 16;
     let ck_reserve = ck_bytes / 40 / nw * 5 / 4 + 16;
-    // Links get their own small pool so they overlap the parse instead of
-    // waiting for a free worker.
-    let link_pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
     let release = std::env::var_os("SS_KEEP").is_none();
-    let (links, a1s) = std::thread::scope(|scope| {
-        let handle = scope.spawn(|| {
-            let l = link_pool.install(|| build_links(&lk_files, cfg.chunk));
-            log!(t0, "links: {} table slots", l.slots());
-            l
-        });
+    let (links, a1s) = {
         let a1s = workers_then(
             env_usize("SS_PARSE_THREADS").unwrap_or(nw),
             jobs.len(),
@@ -1114,8 +1132,8 @@ fn main() {
             |acc, _| acc.ev.finish(),
         );
         log!(t0, "parsed");
-        (handle.join().unwrap(), a1s)
-    });
+        (link_handle.join().unwrap(), a1s)
+    };
     if std::env::var_os("SS_DEBUG").is_some() {
         let aligned = a1s.iter().flat_map(|a| a.ev.outs.iter()).filter(|v| v.as_ptr() as usize % 64 == 0).count();
         log!(t0, "scatter buffers 64-byte aligned: {aligned} of {}", a1s.len() * np);
