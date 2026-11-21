@@ -1081,6 +1081,7 @@ fn main() {
     // Links get their own small pool so they overlap the parse instead of
     // waiting for a free worker.
     let link_pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let release = std::env::var_os("SS_KEEP").is_none();
     let (links, a1s) = std::thread::scope(|scope| {
         let handle = scope.spawn(|| {
             let l = link_pool.install(|| build_links(&lk_files, cfg.chunk));
@@ -1093,9 +1094,21 @@ fn main() {
             || A1 { ev: scatter::Scatter::new(np, ev_reserve), ck: Vec::with_capacity(ck_reserve) },
             |acc, j| {
                 let (kind, fi, s, e) = jobs[j];
+                let file = match kind {
+                    Kind::Events => &ev_files[fi],
+                    Kind::Clicks => &ck_files[fi],
+                };
                 match kind {
-                    Kind::Events => parse_events(&ev_files[fi], s, e, &ctx, acc),
-                    Kind::Clicks => parse_clicks(&ck_files[fi], s, e, &ctx, acc),
+                    Kind::Events => parse_events(file, s, e, &ctx, acc),
+                    Kind::Clicks => parse_clicks(file, s, e, &ctx, acc),
+                }
+                // Unmap the pages that lie wholly inside this piece now, on
+                // this worker, rather than all of them at exit on one thread.
+                if release {
+                    let (a, b) = (s.next_multiple_of(4096), e / 4096 * 4096);
+                    if a < b {
+                        let _ = unsafe { file.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, a, b - a) };
+                    }
                 }
             },
             |acc, _| acc.ev.finish(),
