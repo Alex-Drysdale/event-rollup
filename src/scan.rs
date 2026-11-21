@@ -1,10 +1,15 @@
-//! Chunk scanner for the CSV dialect (see csv.rs for the rules). Instead of
-//! walking bytes, it builds 64-bit masks of `\n`, `,` and `"` for each 64-byte
-//! block (one AVX-512 compare each) and visits only the separators. Quotes are
-//! checked per line: a line with no quote needs no field checks; otherwise
-//! every field must be wrapped (first and last byte a quote, length >= 2) or
-//! quote-free, and the line's quote count must equal two per wrapped field,
-//! which rules out a quote anywhere else.
+//! Chunk scanner for the CSV dialect (see csv.rs for the rules). It works a
+//! line at a time on bit masks: the 128 bytes from the start of a line are
+//! compared with `\n`, `,` and `"` (two AVX-512 compares each), the first
+//! newline bit ends the line, the comma bits below it give the fields, and
+//! the quotes are checked with mask arithmetic alone. Longer lines, and the
+//! last few of a file, take a slower path with the same rules.
+//!
+//! Quotes: number the quotes of a line from 1. The line is well-formed iff
+//! every odd quote is the first byte of a field, every even quote the last
+//! byte of a field, there is no comma between an odd quote and the next one,
+//! and their number is even. Then each odd quote and the next wrap one whole
+//! field, and no field has a quote anywhere else.
 
 use crate::keys::{self, Key};
 
@@ -49,6 +54,64 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 /// How far ahead of the scan to prefetch input.
 const PREFETCH: usize = 1024;
 
+/// The masks of the 128 bytes at `p`.
+#[inline(always)]
+unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+    unsafe {
+        let (a0, b0, c0) = masks(p);
+        let (a1, b1, c1) = masks(p.add(64));
+        (a0 as u128 | (a1 as u128) << 64, b0 as u128 | (b1 as u128) << 64, c0 as u128 | (c1 as u128) << 64)
+    }
+}
+
+/// Bit `i` of the result is the parity of bits `0..=i` of `x`.
+#[inline(always)]
+fn prefix_xor64(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let r = _mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0);
+        _mm_cvtsi128_si64(r) as u64
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+    {
+        let mut x = x;
+        x ^= x << 1;
+        x ^= x << 2;
+        x ^= x << 4;
+        x ^= x << 8;
+        x ^= x << 16;
+        x ^= x << 32;
+        x
+    }
+}
+
+#[inline(always)]
+fn prefix_xor(x: u128) -> u128 {
+    let lo = prefix_xor64(x as u64);
+    let hi = prefix_xor64((x >> 64) as u64) ^ 0u64.wrapping_sub(lo >> 63);
+    lo as u128 | (hi as u128) << 64
+}
+
+/// The bits of `x` at the set bits of `m`, packed from bit 0 up.
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pext_u64(x, m)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let (mut m, mut out, mut k) = (m, 0u64, 0);
+        while m != 0 {
+            out |= ((x >> m.trailing_zeros()) & 1) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        out
+    }
+}
+
 /// Field byte ranges `(start, end)` into the file, quotes removed.
 pub type Fields<const N: usize> = [(usize, usize); N];
 
@@ -57,90 +120,87 @@ pub type Fields<const N: usize> = [(usize, usize); N];
 /// after a `\n`, or the end of the file). A last line without `\n` counts.
 #[inline(always)]
 pub fn scan<const N: usize>(file: &[u8], start: usize, end: usize, mut emit: impl FnMut(&Fields<N>)) {
-    debug_assert!(end <= file.len());
-    let mut seps = [0usize; N];
-    let mut nf = 0usize;
-    let mut line_start = start;
-    let mut q_block = 0u32; // quotes in [start, b)
-    let mut q_line = 0u32; // quotes in [start, line_start)
-    let mut b = start;
-    let mut pad: [u8; 64];
-    while b < end {
-        let (nl, cm, qt) = if b + 64 <= end {
+    assert!(end <= file.len() && N >= 1 && N <= 64);
+    let mut ls = start;
+    while ls < end {
+        if ls + 128 <= file.len() {
             #[cfg(target_arch = "x86_64")]
-            if b + PREFETCH < end {
+            if ls + PREFETCH < end {
                 unsafe {
                     use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                    _mm_prefetch(file.as_ptr().add(b + PREFETCH) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(file.as_ptr().add(ls + PREFETCH) as *const i8, _MM_HINT_T0);
                 }
             }
-            unsafe { masks(file.as_ptr().add(b)) }
-        } else {
-            let n = end - b;
-            pad = [0u8; 64];
-            pad[..n].copy_from_slice(&file[b..end]);
-            unsafe { masks(pad.as_ptr()) }
-        };
-        let mut sep = nl | cm;
-        while sep != 0 {
-            let off = sep.trailing_zeros();
-            let pos = b + off as usize;
-            if (nl >> off) & 1 == 0 {
-                if nf < N - 1 {
-                    seps[nf] = pos;
-                }
-                nf += 1;
-            } else {
-                let below = u64::MAX >> (63 - off); // bits 0..=off
-                let q_at = q_block + (qt & below).count_ones();
-                if nf == N - 1 {
-                    seps[N - 1] = pos;
-                    finish(file, line_start, &seps, q_at - q_line, &mut emit);
-                }
-                line_start = pos + 1;
-                nf = 0;
-                q_line = q_at;
+            let (nl, cm, qt) = unsafe { masks128(file.as_ptr().add(ls)) };
+            if nl != 0 {
+                let len = nl.trailing_zeros();
+                line(ls, len, cm, qt, &mut emit);
+                ls += len as usize + 1;
+                continue;
             }
-            sep &= sep - 1;
         }
-        q_block += qt.count_ones();
-        b += 64;
-    }
-    if line_start < end && nf == N - 1 {
-        seps[N - 1] = end;
-        finish(file, line_start, &seps, q_block - q_line, &mut emit);
+        ls = slow_line(file, ls, end, &mut emit);
     }
 }
 
-#[inline(always)]
-fn finish<const N: usize>(
-    file: &[u8],
-    line_start: usize,
-    seps: &[usize; N],
-    quotes: u32,
-    emit: &mut impl FnMut(&Fields<N>),
-) {
-    // Branch-free: which fields are quoted is random, so branches on it would
-    // mispredict. Data lines start after the header, so `s >= 1` and `e - 1`
-    // is in bounds; `s` itself can be the file's length for an empty last field.
-    let mut f = [(0usize, 0usize); N];
-    let mut s = line_start;
-    let mut expected = 0u32;
-    let mut bad = false;
-    let last = file.len() - 1;
-    for i in 0..N {
-        let e = seps[i];
-        let len = e - s;
-        let nonempty = len >= 1;
-        let fq = nonempty & (file[s.min(last)] == b'"');
-        let lq = nonempty & (file[e.max(1) - 1] == b'"');
-        bad |= (fq != lq) | (fq & (len < 2));
-        expected += 2 * fq as u32;
-        f[i] = (s + fq as usize, e - fq as usize);
-        s = e + 1;
+/// A line that is long, or within 128 bytes of the end of the file. Returns
+/// the start of the next line.
+#[cold]
+#[inline(never)]
+fn slow_line<const N: usize>(file: &[u8], ls: usize, end: usize, emit: &mut impl FnMut(&Fields<N>)) -> usize {
+    let rest = &file[ls..end];
+    let len = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
+    if len < 128 {
+        let mut pad = [0u8; 128];
+        pad[..len].copy_from_slice(&rest[..len]);
+        let (_, cm, qt) = unsafe { masks128(pad.as_ptr()) };
+        line(ls, len as u32, cm, qt, emit);
+    } else if let Some(fields) = crate::csv::split::<N>(&rest[..len]) {
+        let base = file.as_ptr() as usize;
+        let mut f = [(0usize, 0usize); N];
+        for (r, x) in f.iter_mut().zip(fields) {
+            let s = x.as_ptr() as usize - base;
+            *r = (s, s + x.len());
+        }
+        emit(&f);
     }
-    if bad | (expected != quotes) {
+    ls + len + 1
+}
+
+/// The line of `len < 128` bytes at `ls`, given the comma and quote masks of
+/// (at least) its bytes.
+#[inline(always)]
+fn line<const N: usize>(ls: usize, len: u32, cm: u128, qt: u128, emit: &mut impl FnMut(&Fields<N>)) {
+    let below = (1u128 << len) - 1;
+    let c = cm & below;
+    let q = qt & below;
+    // An empty line is malformed whatever `N` is.
+    if c.count_ones() != N as u32 - 1 || len == 0 {
         return;
+    }
+    // Bit `i` of `wrapped`: field `i` is wrapped in quotes.
+    let mut wrapped = 0u64;
+    if q != 0 {
+        let inside = prefix_xor(q); // from each odd quote up to the next quote
+        let starts = (c << 1) | 1;
+        let ends = (c | (1u128 << len)) >> 1;
+        let odd = q & inside;
+        let even = q & !inside;
+        if (inside >> 127) != 0 || (odd & !starts) != 0 || (even & !ends) != 0 || (c & inside) != 0 {
+            return;
+        }
+        let lo = starts as u64;
+        wrapped = pext64(odd as u64, lo) | pext64((odd >> 64) as u64, (starts >> 64) as u64) << lo.count_ones();
+    }
+    let mut f = [(0usize, 0usize); N];
+    let mut rest = c;
+    let mut s = ls;
+    for (i, r) in f.iter_mut().enumerate() {
+        let e = ls + if i == N - 1 { len } else { rest.trailing_zeros() } as usize;
+        rest &= rest.wrapping_sub(1);
+        let w = (wrapped >> i) as usize & 1;
+        *r = (s + w, e - w);
+        s = e + 1;
     }
     emit(&f);
 }
@@ -200,6 +260,51 @@ mod tests {
             }
         }
         assert_eq!(lines::<2>(&text), want);
+    }
+
+    /// Random text over a small alphabet, against the reference splitter.
+    #[test]
+    fn random_lines() {
+        let alphabet: &[u8] = b"ab,,\"\"\n\n\r ";
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20000 {
+            let n = (rnd() % 400) as usize;
+            // Mostly short lines; sometimes long runs without a newline.
+            let long = round % 7 == 0;
+            let text: Vec<u8> = (0..n)
+                .map(|_| {
+                    let c = alphabet[(rnd() % alphabet.len() as u64) as usize];
+                    if long && c == b'\n' && rnd() % 8 != 0 { b'x' } else { c }
+                })
+                .collect();
+            for nf in [1usize, 2, 3, 4, 7] {
+                let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
+                crate::csv::for_lines(&text, |l| {
+                    let fields: Option<Vec<Vec<u8>>> = match nf {
+                        1 => crate::csv::split::<1>(l).map(|f| f.iter().map(|x| x.to_vec()).collect()),
+                        2 => crate::csv::split::<2>(l).map(|f| f.iter().map(|x| x.to_vec()).collect()),
+                        3 => crate::csv::split::<3>(l).map(|f| f.iter().map(|x| x.to_vec()).collect()),
+                        4 => crate::csv::split::<4>(l).map(|f| f.iter().map(|x| x.to_vec()).collect()),
+                        _ => crate::csv::split::<7>(l).map(|f| f.iter().map(|x| x.to_vec()).collect()),
+                    };
+                    want.extend(fields);
+                });
+                let got = match nf {
+                    1 => lines::<1>(&text),
+                    2 => lines::<2>(&text),
+                    3 => lines::<3>(&text),
+                    4 => lines::<4>(&text),
+                    _ => lines::<7>(&text),
+                };
+                assert_eq!(got, want, "{nf} fields: {:?}", String::from_utf8_lossy(&text));
+            }
+        }
     }
 
     #[test]
