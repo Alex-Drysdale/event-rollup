@@ -557,7 +557,8 @@ struct A1 {
 
 #[inline(never)]
 fn parse_events(file: &[u8], s: usize, e: usize, ctx: &Ctx, acc: &mut A1) {
-    scan::scan::<7>(file, s, e, |f| {
+    scan::scan::<7>(file, s, e, #[inline(always)]
+    |f| {
         let [eid, user, tsf, ingest, etype, product, price] = *f;
         if eid.0 == eid.1 {
             return;
